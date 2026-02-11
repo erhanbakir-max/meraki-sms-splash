@@ -109,3 +109,11 @@ const axios = require("axios");
     console.log("IP_ERROR:", err.message);
   }
 })();
+(async () => {
+  try {
+    const res = await axios.get("https://api.iletimerkezi.com");
+    console.log("ILETIMERKEZI_STATUS:", res.status);
+  } catch (err) {
+    console.log("ILETIMERKEZI_ERROR:", err.message);
+  }
+})();
