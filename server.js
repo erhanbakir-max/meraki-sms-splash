@@ -1,119 +1,108 @@
-import express from "express";
-import crypto from "crypto";
+// server.js (ESM - package.json: { "type": "module" })
 
-const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+import http from "http";
+import { URLSearchParams } from "url";
 
-const OTP_TTL_MS = 3 * 60 * 1000;
-const store = new Map(); // PROD: Redis önerilir
+// -------------------------
+// Config / Env
+// -------------------------
+const PORT = process.env.PORT || 3000;
 
-function normalizeTrPhone(p) {
-  const digits = (p || "").replace(/\D/g, "");
-  if (digits.startsWith("90") && digits.length === 12) return "+" + digits;   // 905xxxxxxxxx
-  if (digits.startsWith("0") && digits.length === 11) return "+9" + digits;   // 05xxxxxxxxx
-  if (digits.length === 10) return "+90" + digits;                            // 5xxxxxxxxx
-  return null;
+// İletiMerkezi env değişkenleri (Railway Variables'tan gir)
+const ILETI_KEY = process.env.ILETI_KEY || "";
+const ILETI_HASH = process.env.ILETI_HASH || "";
+const ILETI_SENDER = process.env.ILETI_SENDER || "";
+const ILETI_TEST_MSISDN = process.env.ILETI_TEST_MSISDN || ""; // örn: 5XXXXXXXXX (0 yok)
+const SMS_DEBUG = (process.env.SMS_DEBUG || "false").toLowerCase() === "true";
+
+// -------------------------
+// Helpers
+// -------------------------
+async function fetchText(url, opts = {}) {
+  const res = await fetch(url, { ...opts, redirect: "follow" });
+  const text = await res.text();
+  return { res, text };
 }
 
-function makeOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-app.get("/", (req, res) => {
-  const { base_grant_url, user_continue_url, client_mac, node_id, gateway_id } = req.query;
-
-  if (!base_grant_url || !user_continue_url) {
-    return res.status(400).send("Meraki parametreleri eksik (base_grant_url / user_continue_url).");
+async function netSmokeTest() {
+  try {
+    const { text: ipText } = await fetchText("https://ifconfig.me");
+    console.log("PUBLIC_IP:", ipText.trim());
+  } catch (e) {
+    console.log("IP_ERROR:", e?.message || e);
   }
 
-  res.send(`
-    <h3>Misafir İnternet Girişi</h3>
-    <form method="POST" action="/send-otp">
-      <input type="hidden" name="base_grant_url" value="${base_grant_url}">
-      <input type="hidden" name="user_continue_url" value="${user_continue_url}">
-      <input type="hidden" name="client_mac" value="${client_mac || ""}">
-      <input type="hidden" name="node_id" value="${node_id || ""}">
-      <input type="hidden" name="gateway_id" value="${gateway_id || ""}">
+  try {
+    const { res } = await fetchText("https://api.iletimerkezi.com");
+    console.log("ILETIMERKEZI_HTTP:", res.status);
+  } catch (e) {
+    console.log("ILETIMERKEZI_ERROR:", e?.message || e);
+  }
+}
 
-      <div>Ad: <input name="firstName" required></div>
-      <div>Soyad: <input name="lastName" required></div>
-      <div>Telefon: <input name="phone" placeholder="05xx..." required></div>
+async function iletimerkeziSmsTestGet() {
+  // Zorunlu env’ler yoksa test yapma
+  const missing = [];
+  if (!ILETI_KEY) missing.push("ILETI_KEY");
+  if (!ILETI_HASH) missing.push("ILETI_HASH");
+  if (!ILETI_SENDER) missing.push("ILETI_SENDER");
+  if (!ILETI_TEST_MSISDN) missing.push("ILETI_TEST_MSISDN");
 
-      <button type="submit">SMS Gönder</button>
-    </form>
-  `);
-});
+  if (missing.length) {
+    console.log(
+      "SMS_TEST_SKIPPED: missing env ->",
+      missing.join(", ")
+    );
+    return;
+  }
 
-app.post("/send-otp", async (req, res) => {
-  const { firstName, lastName, phone, base_grant_url, user_continue_url, client_mac, gateway_id } = req.body;
-
-  const normPhone = normalizeTrPhone(phone);
-  if (!normPhone) return res.status(400).send("Telefon formatı hatalı.");
-
-  const otp = makeOtp();
-
-  const key = crypto
-    .createHash("sha256")
-    .update(`${normPhone}|${client_mac || ""}|${gateway_id || ""}`)
-    .digest("hex");
-
-  store.set(key, {
-    otp,
-    expiresAt: Date.now() + OTP_TTL_MS,
-    firstName,
-    lastName,
-    base_grant_url,
-    user_continue_url,
+  // İletiMerkezi GET endpoint params
+  // Dokümana göre: key, hash, text, receipents, sender (+ iys/iysList opsiyonel/bağlı)
+  const params = new URLSearchParams({
+    key: ILETI_KEY,
+    hash: ILETI_HASH,
+    text: "Test OTP (railway debug)",
+    receipents: ILETI_TEST_MSISDN,
+    sender: ILETI_SENDER,
+    iys: "1",
+    iysList: "BIREYSEL",
   });
 
-  // TODO: Buraya SMS sağlayıcı entegrasyonu gelecek
-  // await sendSms(normPhone, `Doğrulama kodunuz: ${otp}`);
+  const url = `https://api.iletimerkezi.com/v1/send-sms/get/?${params.toString()}`;
 
-  res.send(`
-    <h3>SMS gönderildi</h3>
-    <form method="POST" action="/verify-otp">
-      <input type="hidden" name="key" value="${key}">
-      <div>Kod: <input name="otp" maxlength="6" required></div>
-      <button type="submit">Doğrula</button>
-    </form>
-  `);
+  try {
+    const { res, text } = await fetchText(url);
+    console.log("SMS_HTTP:", res.status);
+    console.log("SMS_BODY:", text);
+  } catch (e) {
+    console.log("SMS_TEST_ERROR:", e?.message || e);
+  }
+}
+
+// -------------------------
+// Simple server (health endpoint)
+// -------------------------
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("meraki-sms-splash is running\n");
 });
 
-app.post("/verify-otp", (req, res) => {
-  const { key, otp } = req.body;
-  const rec = store.get(key);
-  if (!rec) return res.status(400).send("Oturum bulunamadı / süresi doldu.");
+server.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
 
-  if (Date.now() > rec.expiresAt) {
-    store.delete(key);
-    return res.status(400).send("Kod süresi doldu.");
+  // 1) Net test her startta 1 kez
+  await netSmokeTest();
+
+  // 2) İstersen SMS debug test (env ile aç/kapat)
+  if (SMS_DEBUG) {
+    await iletimerkeziSmsTestGet();
+  } else {
+    console.log("SMS_DEBUG disabled (set SMS_DEBUG=true to run SMS test once on startup)");
   }
-
-  if (String(otp).trim() !== rec.otp) return res.status(400).send("Kod yanlış.");
-
-  store.delete(key);
-
-  // İnternete çıkış (Meraki grant)
-  res.redirect(rec.base_grant_url);
 });
-
-app.listen(process.env.PORT || 8080, () => console.log("Server up"));
-const axios = require("axios");
-
-(async () => {
-  try {
-    const ip = await axios.get("https://ifconfig.me");
-    console.log("PUBLIC_IP:", ip.data);
-  } catch (err) {
-    console.log("IP_ERROR:", err.message);
-  }
-})();
-(async () => {
-  try {
-    const res = await axios.get("https://api.iletimerkezi.com");
-    console.log("ILETIMERKEZI_STATUS:", res.status);
-  } catch (err) {
-    console.log("ILETIMERKEZI_ERROR:", err.message);
-  }
-})();
