@@ -99,3 +99,13 @@ app.post("/verify-otp", (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080, () => console.log("Server up"));
+const axios = require("axios");
+
+(async () => {
+  try {
+    const ip = await axios.get("https://ifconfig.me");
+    console.log("PUBLIC_IP:", ip.data);
+  } catch (err) {
+    console.log("IP_ERROR:", err.message);
+  }
+})();
