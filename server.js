@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const ILETI_KEY = process.env.ILETI_KEY || "";
 const ILETI_HASH = process.env.ILETI_HASH || "";
 const ILETI_SENDER = process.env.ILETI_SENDER || "";
-const ILETI_TEST_MSISDN = process.env.ILETI_TEST_MSISDN || ""; // 5XXXXXXXXX (0 yok)
+const ILETI_TEST_MSISDN = process.env.ILETI_TEST_MSISDN || ""; // beklenen: 5XXXXXXXXX
 
 const SMS_DEBUG = (process.env.SMS_DEBUG || "false").toLowerCase() === "true";
 
@@ -24,6 +24,33 @@ async function fetchText(url, opts = {}) {
   return { res, text };
 }
 
+function normalizeMsisdn(input) {
+  // trim + sadece rakam
+  const cleaned = String(input || "").trim().replace(/\D/g, "");
+  return cleaned;
+}
+
+function envCheck() {
+  const cleaned = normalizeMsisdn(ILETI_TEST_MSISDN);
+
+  console.log("ENV_CHECK:", {
+    SMS_DEBUG,
+    hasKey: !!ILETI_KEY,
+    hasHash: !!ILETI_HASH,
+    hasSender: !!ILETI_SENDER,
+    hasTestMsisdn: !!ILETI_TEST_MSISDN,
+    sender: ILETI_SENDER || null,
+  });
+
+  console.log("MSISDN_DEBUG:", {
+    raw: ILETI_TEST_MSISDN,
+    cleanedLen: cleaned.length,
+    cleanedLast4: cleaned ? cleaned.slice(-4) : null,
+    // güvenli: tam numarayı yazdırmak istemezsen aşağıyı kapatabilirsin
+    cleaned,
+  });
+}
+
 async function netSmokeTest() {
   // Public IP (plain text)
   try {
@@ -33,7 +60,7 @@ async function netSmokeTest() {
     console.log("IP_ERROR:", e?.message || e);
   }
 
-  // Basic reachability
+  // İletiMerkezi erişim
   try {
     const { res } = await fetchText("https://api.iletimerkezi.com");
     console.log("ILETIMERKEZI_HTTP:", res.status);
@@ -42,51 +69,61 @@ async function netSmokeTest() {
   }
 }
 
-function logEnvCheck() {
-  console.log("ENV_CHECK:", {
-    SMS_DEBUG,
-    hasKey: !!ILETI_KEY,
-    hasHash: !!ILETI_HASH,
-    hasSender: !!ILETI_SENDER,
-    hasTestMsisdn: !!ILETI_TEST_MSISDN,
-    // güvenli: sadece son 4 haneyi göster
-    testMsisdnLast4: ILETI_TEST_MSISDN
-      ? ILETI_TEST_MSISDN.slice(-4)
-      : null,
-    sender: ILETI_SENDER || null,
-  });
-}
+async function sendSmsTestOnce() {
+  const cleaned = normalizeMsisdn(ILETI_TEST_MSISDN);
 
-async function iletimerkeziSmsTestGet() {
   const missing = [];
   if (!ILETI_KEY) missing.push("ILETI_KEY");
   if (!ILETI_HASH) missing.push("ILETI_HASH");
   if (!ILETI_SENDER) missing.push("ILETI_SENDER");
-  if (!ILETI_TEST_MSISDN) missing.push("ILETI_TEST_MSISDN");
+  if (!cleaned) missing.push("ILETI_TEST_MSISDN(empty after cleaning)");
 
   if (missing.length) {
     console.log("SMS_TEST_SKIPPED: missing env ->", missing.join(", "));
     return;
   }
 
-  const params = new URLSearchParams({
+  // Türkiye formatı doğrulama (10 hane, 5 ile başlar)
+  // Eğer burada fail olursa 452 zaten beklenir.
+  if (!/^5\d{9}$/.test(cleaned)) {
+    console.log(
+      "SMS_TEST_SKIPPED: MSISDN format invalid. Expected 5XXXXXXXXX (10 digits). Got:",
+      cleaned
+    );
+    return;
+  }
+
+  const base = {
     key: ILETI_KEY,
     hash: ILETI_HASH,
     text: "Test OTP (railway debug)",
-    receipents: ILETI_TEST_MSISDN, // dokümana göre bu isimle
     sender: ILETI_SENDER,
     iys: "1",
     iysList: "BIREYSEL",
-  });
+  };
 
-  const url = `https://api.iletimerkezi.com/v1/send-sms/get/?${params.toString()}`;
+  // A/B: param adı farkı olabilir diye iki deneme
+  const variants = [
+    { name: "receipents", params: { ...base, receipents: cleaned } }, // dokümandaki yazım
+    { name: "recipients", params: { ...base, recipients: cleaned } }, // alternatif yazım
+  ];
 
-  try {
-    const { res, text } = await fetchText(url);
-    console.log("SMS_HTTP:", res.status);
-    console.log("SMS_BODY:", text);
-  } catch (e) {
-    console.log("SMS_TEST_ERROR:", e?.message || e);
+  for (const v of variants) {
+    const qs = new URLSearchParams(v.params);
+    const url = `https://api.iletimerkezi.com/v1/send-sms/get/?${qs.toString()}`;
+
+    try {
+      const { res, text } = await fetchText(url);
+      console.log("SMS_VARIANT:", v.name);
+      console.log("SMS_HTTP:", res.status);
+      console.log("SMS_BODY:", text);
+
+      // Eğer başarılı bir cevap aldıysak diğer varyantı denemeyi kesmek istersen:
+      // if (res.status === 200) break;
+    } catch (e) {
+      console.log("SMS_VARIANT:", v.name);
+      console.log("SMS_TEST_ERROR:", e?.message || e);
+    }
   }
 }
 
@@ -107,18 +144,16 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
 
-  // Env durumunu her startta yaz
-  logEnvCheck();
+  // Env + msisdn debug
+  envCheck();
 
-  // Network test her startta 1 kez
+  // Network test
   await netSmokeTest();
 
-  // İstersen SMS debug test (env ile aç/kapat)
+  // SMS test (startup'ta 1 kez)
   if (SMS_DEBUG) {
-    await iletimerkeziSmsTestGet();
+    await sendSmsTestOnce();
   } else {
-    console.log(
-      "SMS_DEBUG disabled (set SMS_DEBUG=true to run SMS test once on startup)"
-    );
+    console.log("SMS_DEBUG disabled (set SMS_DEBUG=true to run SMS test once on startup)");
   }
 });
