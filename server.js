@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const ILETI_KEY = process.env.ILETI_KEY || "";
 const ILETI_HASH = process.env.ILETI_HASH || "";
 const ILETI_SENDER = process.env.ILETI_SENDER || "";
-const ILETI_TEST_MSISDN = process.env.ILETI_TEST_MSISDN || ""; // beklenen: 5XXXXXXXXX
+const ILETI_TEST_MSISDN = process.env.ILETI_TEST_MSISDN || ""; // 10 hane: 5XXXXXXXXX
 
 const SMS_DEBUG = (process.env.SMS_DEBUG || "false").toLowerCase() === "true";
 
@@ -26,11 +26,10 @@ async function fetchText(url, opts = {}) {
 
 function normalizeMsisdn(input) {
   // trim + sadece rakam
-  const cleaned = String(input || "").trim().replace(/\D/g, "");
-  return cleaned;
+  return String(input || "").trim().replace(/\D/g, "");
 }
 
-function envCheck() {
+function logEnvAndMsisdn() {
   const cleaned = normalizeMsisdn(ILETI_TEST_MSISDN);
 
   console.log("ENV_CHECK:", {
@@ -46,13 +45,13 @@ function envCheck() {
     raw: ILETI_TEST_MSISDN,
     cleanedLen: cleaned.length,
     cleanedLast4: cleaned ? cleaned.slice(-4) : null,
-    // güvenli: tam numarayı yazdırmak istemezsen aşağıyı kapatabilirsin
+    // İstersen bunu kaldırabilirsin; debug için bıraktım:
     cleaned,
   });
 }
 
 async function netSmokeTest() {
-  // Public IP (plain text)
+  // Public IP (plain)
   try {
     const { text: ipText } = await fetchText("https://ifconfig.me/ip");
     console.log("PUBLIC_IP:", ipText.trim());
@@ -83,8 +82,7 @@ async function sendSmsTestOnce() {
     return;
   }
 
-  // Türkiye formatı doğrulama (10 hane, 5 ile başlar)
-  // Eğer burada fail olursa 452 zaten beklenir.
+  // TR GSM format: 10 hane, 5 ile başlar
   if (!/^5\d{9}$/.test(cleaned)) {
     console.log(
       "SMS_TEST_SKIPPED: MSISDN format invalid. Expected 5XXXXXXXXX (10 digits). Got:",
@@ -93,42 +91,29 @@ async function sendSmsTestOnce() {
     return;
   }
 
-  const base = {
+  const params = new URLSearchParams({
     key: ILETI_KEY,
     hash: ILETI_HASH,
     text: "Test OTP (railway debug)",
-    sender: ILETI_SENDER,
+    receipents: cleaned, // DOĞRU param adı
+    sender: ILETI_SENDER, // 450 alırsan -> başlık uygun değil / onaylı değil / farklı yazım
     iys: "1",
     iysList: "BIREYSEL",
-  };
+  });
 
-  // A/B: param adı farkı olabilir diye iki deneme
-  const variants = [
-    { name: "receipents", params: { ...base, receipents: cleaned } }, // dokümandaki yazım
-    { name: "recipients", params: { ...base, recipients: cleaned } }, // alternatif yazım
-  ];
+  const url = `https://api.iletimerkezi.com/v1/send-sms/get/?${params.toString()}`;
 
-  for (const v of variants) {
-    const qs = new URLSearchParams(v.params);
-    const url = `https://api.iletimerkezi.com/v1/send-sms/get/?${qs.toString()}`;
-
-    try {
-      const { res, text } = await fetchText(url);
-      console.log("SMS_VARIANT:", v.name);
-      console.log("SMS_HTTP:", res.status);
-      console.log("SMS_BODY:", text);
-
-      // Eğer başarılı bir cevap aldıysak diğer varyantı denemeyi kesmek istersen:
-      // if (res.status === 200) break;
-    } catch (e) {
-      console.log("SMS_VARIANT:", v.name);
-      console.log("SMS_TEST_ERROR:", e?.message || e);
-    }
+  try {
+    const { res, text } = await fetchText(url);
+    console.log("SMS_HTTP:", res.status);
+    console.log("SMS_BODY:", text);
+  } catch (e) {
+    console.log("SMS_TEST_ERROR:", e?.message || e);
   }
 }
 
 // -------------------------
-// Simple server (health endpoint)
+// Simple server
 // -------------------------
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -144,13 +129,9 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
 
-  // Env + msisdn debug
-  envCheck();
-
-  // Network test
+  logEnvAndMsisdn();
   await netSmokeTest();
 
-  // SMS test (startup'ta 1 kez)
   if (SMS_DEBUG) {
     await sendSmsTestOnce();
   } else {
