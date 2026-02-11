@@ -26,8 +26,10 @@ async function fetchText(url, opts = {}) {
 
 async function netSmokeTest() {
   try {
-    const { text: ipText } = await fetchText("https://ifconfig.me/ip");
-    console.log("PUBLIC_IP:", ipText.trim());
+    const { text: ipText } = await fetchText("https://ifconfig.me", {
+  headers: { "Accept": "text/plain" },
+});
+console.log("PUBLIC_IP:", ipText.trim());
   } catch (e) {
     console.log("IP_ERROR:", e?.message || e);
   }
