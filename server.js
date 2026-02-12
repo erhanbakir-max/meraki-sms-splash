@@ -5,22 +5,17 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 
 let redisCreateClient = null;
-try {
-  ({ createClient: redisCreateClient } = require('redis'));
-} catch (_) {}
+try { ({ createClient: redisCreateClient } = require('redis')); } catch (_) {}
 
 const app = express();
 app.set('trust proxy', true);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-/* =======================
- * ENV
- * ======================= */
 const ENV = {
   PORT: Number(process.env.PORT || 8080),
 
-  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(), // screen
+  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(),
   OTP_TTL_SECONDS: Number(process.env.OTP_TTL_SECONDS || 180),
 
   MAX_WRONG_ATTEMPTS: Number(process.env.MAX_WRONG_ATTEMPTS || 5),
@@ -43,14 +38,14 @@ console.log('ENV:', {
 });
 
 /* =======================
- * REDIS (required for stable flow)
+ * REDIS
  * ======================= */
 let redis = null;
 let redisReady = false;
 
 async function initRedis() {
   if (!ENV.REDIS_URL || !redisCreateClient) {
-    console.log('REDIS: not configured. (This will break stable flow.)');
+    console.log('REDIS: not configured.');
     return;
   }
   redis = redisCreateClient({ url: ENV.REDIS_URL });
@@ -80,7 +75,7 @@ function sessKey(mac) {
 }
 
 /* =======================
- * POSTGRES (optional but you have it)
+ * POSTGRES + AUTO MIGRATION
  * ======================= */
 const pool = ENV.DATABASE_URL ? new Pool({ connectionString: ENV.DATABASE_URL }) : null;
 
@@ -92,6 +87,7 @@ async function initDatabase() {
   await pool.query('SELECT 1');
   console.log('DATABASE: connected');
 
+  // Create if missing (new installs)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_logs (
       id BIGSERIAL PRIMARY KEY,
@@ -110,6 +106,25 @@ async function initDatabase() {
       meta JSONB
     );
   `);
+
+  // Auto-migrate older tables (adds missing columns safely)
+  const alters = [
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS continue_url TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS base_grant_url TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_mac TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_ip TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS ssid TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS ap_name TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS marker TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS phone TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS full_name TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS kvkk_version TEXT;`,
+    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS meta JSONB;`
+  ];
+  for (const sql of alters) {
+    try { await pool.query(sql); } catch (_) {}
+  }
+
   console.log('DATABASE: table ready');
 }
 
@@ -142,7 +157,7 @@ async function logDb(event, data) {
 /* =======================
  * Helpers
  * ======================= */
-function safeStr(x, max = 800) {
+function safeStr(x, max = 1200) {
   if (x == null) return '';
   const s = String(x);
   return s.length > max ? s.slice(0, max) : s;
@@ -173,15 +188,6 @@ function randOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-function kvkkPlaceholderHtml() {
-  return `
-  <strong>KVKK Aydınlatma Metni (Placeholder)</strong><br/>
-  Bu metin şimdilik örnektir. Gerçek metin daha sonra eklenecek.<br/><br/>
-  İşlenen veriler: Ad, Soyad, Telefon, MAC, IP, zaman damgaları.<br/>
-  Amaç: Misafir internet erişimi + 5651 loglama.
-  `;
-}
-
 function renderPage(title, inner) {
   return `<!doctype html><html lang="tr"><head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -192,7 +198,6 @@ function renderPage(title, inner) {
     .mut{color:#6b7280;font-size:12px}
     input,button{width:100%;padding:12px 12px;border-radius:12px;border:1px solid #d1d5db;font-size:14px}
     button{border:0;background:#4f46e5;color:#fff;font-weight:700;cursor:pointer;margin-top:10px}
-    .kvkk{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;max-height:170px;overflow:auto;font-size:12px;color:#4b5563}
     .otp{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:34px;letter-spacing:4px;font-weight:900;
          text-align:center;padding:10px;border:1px dashed #9ca3af;border-radius:14px;background:#f9fafb;margin:10px 0}
     .ok{background:#ecfdf5;border:1px solid #86efac;color:#166534;padding:10px;border-radius:12px;margin-top:10px}
@@ -205,24 +210,13 @@ function renderPage(title, inner) {
 }
 
 /* =======================
- * Meraki grant caller
+ * Meraki grant caller (DO NOT mutate base_grant_url)
  * ======================= */
-async function callMerakiGrant(baseGrantUrl, continueUrl) {
-  // base_grant_url + continue_url + duration
-  let url = baseGrantUrl;
-  try {
-    const u = new URL(baseGrantUrl);
-    if (continueUrl) u.searchParams.set('continue_url', continueUrl);
-    u.searchParams.set('duration', '3600');
-    url = u.toString();
-  } catch (_) {
-    const glue = url.includes('?') ? '&' : '?';
-    url = `${url}${glue}continue_url=${encodeURIComponent(continueUrl)}&duration=3600`;
-  }
+async function callMerakiGrant(baseGrantUrl) {
+  // IMPORTANT: do not append continue_url/duration -> some endpoints break parsing (your case)
+  console.log('GRANT_URL:', baseGrantUrl);
 
-  console.log('GRANT_URL:', url);
-
-  const r = await fetch(url, { method: 'GET' });
+  const r = await fetch(baseGrantUrl, { method: 'GET' });
   const txt = await r.text();
 
   console.log('GRANT_HTTP:', r.status);
@@ -244,7 +238,6 @@ app.get('/', async (req, res) => {
     return res.status(400).send(renderPage('Hata', `<h3>Geçersiz istek</h3><div class="err">client_mac / base_grant_url eksik.</div>`));
   }
 
-  // session store
   const sk = sessKey(m.clientMac);
   await kvSet(sk, {
     meraki: {
@@ -266,12 +259,7 @@ app.get('/', async (req, res) => {
     continue_url: m.continueUrl,
   });
 
-  const logo = ENV.COMPANY_LOGO_URL
-    ? `<div style="text-align:center;margin-bottom:10px"><img src="${safeStr(ENV.COMPANY_LOGO_URL,400)}" style="max-height:64px;max-width:240px"/></div>`
-    : '';
-
   res.send(renderPage('Guest Wi-Fi', `
-    ${logo}
     <h2 style="margin:0 0 6px 0">${safeStr(ENV.BRAND_NAME,60)}</h2>
     <div class="mut">Misafir internet erişimi</div>
 
@@ -292,12 +280,9 @@ app.get('/', async (req, res) => {
       <label>Cep telefonu</label>
       <input name="phone" required maxlength="25" placeholder="05xx..."/>
 
-      <label>KVKK</label>
-      <div class="kvkk">${kvkkPlaceholderHtml()}</div>
-
       <label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px">
         <input type="checkbox" name="kvkk_accepted" value="1" required style="width:18px;height:18px;margin-top:3px"/>
-        <span class="mut" style="font-size:13px;color:#374151">KVKK metnini okudum ve kabul ediyorum.</span>
+        <span class="mut" style="font-size:13px;color:#374151">KVKK metnini okudum ve kabul ediyorum. (${ENV.KVKK_VERSION})</span>
       </label>
 
       <button type="submit">Devam et</button>
@@ -370,19 +355,7 @@ app.post('/verify', async (req, res) => {
   }
 
   if (otp_in !== sess.otp.value) {
-    sess.otp.wrong = (sess.otp.wrong || 0) + 1;
-    await kvSet(sk, sess, Math.ceil((sess.otp.expiresAt - Date.now()) / 1000));
-
-    return res.status(401).send(renderPage('Hatalı', `
-      <h3>Hatalı kod</h3>
-      <div class="err">${sess.otp.wrong}/${ENV.MAX_WRONG_ATTEMPTS}</div>
-      <form method="POST" action="/verify">
-        <input type="hidden" name="client_mac" value="${client_mac}"/>
-        <label>Tekrar girin</label>
-        <input name="otp" required inputmode="numeric" maxlength="10"/>
-        <button type="submit">Doğrula</button>
-      </form>
-    `));
+    return res.status(401).send(renderPage('Hatalı', `<h3>Hatalı kod</h3><div class="err">Tekrar deneyin.</div>`));
   }
 
   console.log('OTP_VERIFY_OK', { marker: sess.otp.marker, client_mac });
@@ -399,78 +372,53 @@ app.post('/verify', async (req, res) => {
     full_name: `${sess.user?.first_name || ''} ${sess.user?.last_name || ''}`.trim(),
   });
 
-  // ✅ AUTO GRANT
-  try {
-    await logDb('GRANT_CALLED', {
+  // AUTO GRANT (no params)
+  const grant = await callMerakiGrant(sess.meraki.baseGrantUrl);
+
+  if (!grant.ok) {
+    await logDb('GRANT_FAIL', {
       client_mac,
       client_ip: sess.meraki.clientIp,
       base_grant_url: sess.meraki.baseGrantUrl,
       continue_url: sess.meraki.continueUrl,
       marker: sess.otp.marker,
-      phone: sess.user?.phone,
-      full_name: `${sess.user?.first_name || ''} ${sess.user?.last_name || ''}`.trim(),
+      meta: { http: grant.status, body_snip: safeStr(grant.body, 200) }
     });
 
-    const grant = await callMerakiGrant(sess.meraki.baseGrantUrl, sess.meraki.continueUrl);
-
-    if (!grant.ok) {
-      await logDb('GRANT_FAIL', {
-        client_mac,
-        client_ip: sess.meraki.clientIp,
-        base_grant_url: sess.meraki.baseGrantUrl,
-        continue_url: sess.meraki.continueUrl,
-        marker: sess.otp.marker,
-        meta: { http: grant.status, body_snip: safeStr(grant.body, 200) }
-      });
-
-      return res.status(502).send(renderPage('Grant Hata', `
-        <h3>Meraki grant başarısız</h3>
-        <div class="err">HTTP ${grant.status}</div>
-        <div class="mut">Loglarda GRANT_BODY_SNIP var.</div>
-      `));
-    }
-
-    await logDb('GRANT_OK', {
-      client_mac,
-      client_ip: sess.meraki.clientIp,
-      base_grant_url: sess.meraki.baseGrantUrl,
-      continue_url: sess.meraki.continueUrl,
-      marker: sess.otp.marker,
-    });
-
-    // session cleanup
-    await kvDel(sk);
-
-    // ✅ loop kırıcı: 1 sn bekle ve devam et
-    const cont = sess.meraki.continueUrl || '/';
-    return res.status(200).send(renderPage('Bağlanıyor', `
-      <h3>Bağlantı verildi</h3>
-      <div class="ok">1 saniye sonra devam edilecek…</div>
-      <script>setTimeout(()=>{ window.location.href=${JSON.stringify(cont)}; }, 1000);</script>
-      <div class="mut" style="margin-top:10px">Olmazsa bu linke tıkla:</div>
-      <a href="${cont}">${cont}</a>
+    return res.status(502).send(renderPage('Grant Hata', `
+      <h3>Meraki grant başarısız</h3>
+      <div class="err">HTTP ${grant.status}</div>
+      <div class="mut">GRANT_BODY_SNIP logda.</div>
     `));
-  } catch (e) {
-    console.error('GRANT_ERROR:', e?.message || e);
-    await logDb('GRANT_ERROR', {
-      client_mac,
-      client_ip: sess.meraki.clientIp,
-      base_grant_url: sess.meraki.baseGrantUrl,
-      continue_url: sess.meraki.continueUrl,
-      marker: sess.otp.marker,
-      meta: { error: safeStr(e?.message || e, 250) }
-    });
-
-    return res.status(500).send(renderPage('Hata', `<h3>Grant hata</h3><div class="err">${safeStr(e?.message || e, 250)}</div>`));
   }
+
+  await logDb('GRANT_OK', {
+    client_mac,
+    client_ip: sess.meraki.clientIp,
+    base_grant_url: sess.meraki.baseGrantUrl,
+    continue_url: sess.meraki.continueUrl,
+    marker: sess.otp.marker,
+  });
+
+  await kvDel(sk);
+
+  // loop kırıcı: 1 sn bekle
+  const cont = sess.meraki.continueUrl || '/';
+  return res.status(200).send(renderPage('Bağlanıyor', `
+    <h3>Bağlantı verildi</h3>
+    <div class="ok">1 saniye sonra devam edilecek…</div>
+    <script>setTimeout(()=>{ window.location.href=${JSON.stringify(cont)}; }, 1000);</script>
+    <div class="mut" style="margin-top:10px">Olmazsa bu linke tıkla:</div>
+    <a href="${cont}">${cont}</a>
+  `));
 });
 
 /* =======================
  * START
  * ======================= */
 (async () => {
-  await initRedis();
   await initDatabase();
+  await initRedis();
 
   app.listen(ENV.PORT, () => {
     console.log(`Server running on port ${ENV.PORT}`);
