@@ -1,10 +1,5 @@
-'use strict';
-
-// SMS şimdilik kapalı.
-// Anlaşma bitince burayı gerçek provider ile dolduracağız.
-
-async function sendSms(/* phone, text */) {
-  return { ok: false, disabled: true };
+// smsservice.js  (şimdilik kapalı / placeholder)
+export async function sendOtpSms({ msisdn, code }) {
+  // SMS daha sonra devreye alınacak.
+  return { ok: false, skipped: true, reason: "SMS_DISABLED" };
 }
-
-module.exports = { sendSms };
