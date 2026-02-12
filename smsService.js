@@ -1,26 +1,22 @@
 // smsService.js (ESM)
-// İletiMerkezi SMS gönderimi + TR MSISDN normalize
 
 const ILETIMERKEZI_URL =
   process.env.ILETIMERKEZI_URL ||
-  "https://api.iletimerkezi.com/v1/send-sms"; // sizde farklıysa ENV ile override edin
+  "https://api.iletimerkezi.com/v1/send-sms"; // gerekirse ENV ile değiştir
 
 function onlyDigits(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
-// Kullanıcı: 0533..., +90533..., 90533..., 533... => API'ye: 533...
 export function normalizeTrMsisdn(input) {
   const raw = String(input || "").trim();
   let d = onlyDigits(raw);
 
   if (!d) return "";
 
-  // +90 / 90 / 0 prefix düzeltmeleri
   if (d.startsWith("90") && d.length >= 12) d = d.slice(2);
   if (d.startsWith("0") && d.length === 11) d = d.slice(1);
 
-  // 10 hane olmalı ve 5 ile başlamalı (TR GSM)
   if (!/^5\d{9}$/.test(d)) return "";
 
   return d;
@@ -36,7 +32,6 @@ function escapeXml(s) {
 }
 
 function parseIletiXml(xml) {
-  // Minimal parse: <code>200</code>, <message>...</message>, <id>...</id>
   const code = (xml.match(/<code>(\d+)<\/code>/) || [])[1] || null;
   const message = (xml.match(/<message>([\s\S]*?)<\/message>/) || [])[1] || null;
   const orderId = (xml.match(/<id>(\d+)<\/id>/) || [])[1] || null;
@@ -78,28 +73,16 @@ export async function sendOtpSms({ phone, text }) {
   try {
     const r = await fetch(ILETIMERKEZI_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "text/xml; charset=UTF-8"
-      },
+      headers: { "Content-Type": "text/xml; charset=UTF-8" },
       body: xml
     });
 
     respText = await r.text();
-
     const parsed = parseIletiXml(respText);
-    const code = parsed.code;
 
-    if (code === 200) {
-      return { ok: true, orderId: parsed.orderId || null };
-    }
+    if (parsed.code === 200) return { ok: true, orderId: parsed.orderId || null };
 
-    return {
-      ok: false,
-      error: "ILETIMERKEZI_ERROR",
-      code,
-      message: parsed.message || "Unknown error",
-      raw: respText
-    };
+    return { ok: false, error: "ILETIMERKEZI_ERROR", code: parsed.code, message: parsed.message, raw: respText };
   } catch (e) {
     return { ok: false, error: "NETWORK_ERROR", code: null, message: e?.message || String(e), raw: respText };
   }
