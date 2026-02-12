@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
+  "pg": "^8.11.3"
   "scripts": {
     "start": "node server.js"
   },
