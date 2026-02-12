@@ -1,6 +1,10 @@
-// smsService.js (şimdilik kullanılmıyor)
-// Firma onayı gelince burayı gerçek SMS servisine bağlarız.
+'use strict';
 
-export async function sendOtpSms(_args) {
-  return { ok: false, error: "SMS_DISABLED" };
+// SMS şimdilik kapalı.
+// Anlaşma bitince burayı gerçek provider ile dolduracağız.
+
+async function sendSms(/* phone, text */) {
+  return { ok: false, disabled: true };
 }
+
+module.exports = { sendSms };
