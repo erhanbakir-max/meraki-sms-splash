@@ -1,5 +1,23 @@
 'use strict';
 
+/**
+ * Meraki Guest Splash (OTP screen) + KVKK placeholder + 5651 event logging (Postgres)
+ * + Redis session store + client-side Meraki grant redirect (fixes eu.network-auth.com 400)
+ *
+ * Required ENV (Railway):
+ * - REDIS_URL (or REDIS_PUBLIC_URL)
+ * - DATABASE_URL (Railway Postgres)
+ * Optional:
+ * - BRAND_NAME
+ * - COMPANY_LOGO_URL
+ * - KVKK_VERSION
+ * - OTP_TTL_SECONDS
+ * - MAX_WRONG_ATTEMPTS
+ * - LOCK_SECONDS
+ * - RL_MAC_SECONDS
+ * - RL_PHONE_SECONDS
+ */
+
 const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
@@ -18,20 +36,21 @@ app.use(express.json());
 const ENV = {
   PORT: Number(process.env.PORT || 8080),
 
-  // OTP
-  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(), // screen | sms (sms sonra)
+  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(), // screen only for now
   OTP_TTL_SECONDS: Number(process.env.OTP_TTL_SECONDS || 180),
 
-  // Security
   MAX_WRONG_ATTEMPTS: Number(process.env.MAX_WRONG_ATTEMPTS || 5),
   LOCK_SECONDS: Number(process.env.LOCK_SECONDS || 600),
 
-  // UI / KVKK
+  // simple rate limits (OTP creation)
+  RL_MAC_SECONDS: Number(process.env.RL_MAC_SECONDS || 30),
+  RL_PHONE_SECONDS: Number(process.env.RL_PHONE_SECONDS || 60),
+
   KVKK_VERSION: process.env.KVKK_VERSION || '2026-02-12-placeholder',
+
   BRAND_NAME: process.env.BRAND_NAME || 'Guest Wi-Fi',
   COMPANY_LOGO_URL: process.env.COMPANY_LOGO_URL || '',
 
-  // Redis / Postgres
   REDIS_URL: process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || '',
   DATABASE_URL: process.env.DATABASE_URL || '',
 };
@@ -39,6 +58,8 @@ const ENV = {
 console.log('ENV:', {
   OTP_MODE: ENV.OTP_MODE,
   OTP_TTL_SECONDS: ENV.OTP_TTL_SECONDS,
+  RL_MAC_SECONDS: ENV.RL_MAC_SECONDS,
+  RL_PHONE_SECONDS: ENV.RL_PHONE_SECONDS,
   MAX_WRONG_ATTEMPTS: ENV.MAX_WRONG_ATTEMPTS,
   LOCK_SECONDS: ENV.LOCK_SECONDS,
   KVKK_VERSION: ENV.KVKK_VERSION,
@@ -52,7 +73,7 @@ let redisReady = false;
 
 async function initRedis() {
   if (!ENV.REDIS_URL || !redisCreateClient) {
-    console.log('REDIS: not configured.');
+    console.log('REDIS: not configured. (Sessions will break across requests.)');
     return;
   }
   redis = redisCreateClient({ url: ENV.REDIS_URL });
@@ -75,11 +96,20 @@ async function kvDel(key) {
   if (!redisReady) return;
   await redis.del(key);
 }
-
-function sessKey(mac) {
-  const h = crypto.createHash('sha256').update(mac).digest('hex').slice(0, 24);
-  return `sess:${h}`;
+async function kvSetNX(key, value, ttlSeconds) {
+  if (!redisReady) return false;
+  // SET key value NX EX ttl
+  const ok = await redis.set(key, value, { NX: true, EX: ttlSeconds });
+  return ok === 'OK';
 }
+
+function hashShort(s) {
+  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 24);
+}
+function sessKey(mac) { return `sess:${hashShort(mac)}`; }
+function rlMacKey(mac) { return `rl:mac:${hashShort(mac)}`; }
+function rlPhoneKey(phone) { return `rl:ph:${hashShort(phone)}`; }
+function lockKey(mac) { return `lock:${hashShort(mac)}`; }
 
 /* =======================
  * POSTGRES (5651 logs) + auto migration
@@ -94,7 +124,7 @@ async function initDatabase() {
   await pool.query('SELECT 1');
   console.log('DATABASE: connected');
 
-  // Create if missing
+  // Create base table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_logs (
       id BIGSERIAL PRIMARY KEY,
@@ -114,7 +144,7 @@ async function initDatabase() {
     );
   `);
 
-  // Auto-migrate older schemas safely
+  // Safe migrations for older schema
   const alters = [
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_mac TEXT;`,
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_ip TEXT;`,
@@ -129,13 +159,13 @@ async function initDatabase() {
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS meta JSONB;`,
   ];
   for (const sql of alters) {
-    try { await pool.query(sql); } catch (_) {}
+    try { await pool.query(sql); } catch (e) { /* ignore */ }
   }
 
   console.log('DATABASE: table ready');
 }
 
-async function logDb(event, data) {
+async function logDb(event, data = {}) {
   if (!pool) return;
   try {
     await pool.query(
@@ -164,7 +194,7 @@ async function logDb(event, data) {
 /* =======================
  * Helpers
  * ======================= */
-function safeStr(x, max = 1500) {
+function safeStr(x, max = 1600) {
   if (x == null) return '';
   const s = String(x);
   return s.length > max ? s.slice(0, max) : s;
@@ -189,8 +219,34 @@ function parseMeraki(req) {
   };
 }
 
+// Store phone in a consistent way for logs (KVKK/5651). (Not for SMS yet.)
+function normalizePhoneTR(input) {
+  const digits = (input || '').replace(/[^\d]/g, '');
+  // Accept: 05xxxxxxxxx (11) -> 5xxxxxxxxx
+  if (digits.length === 11 && digits.startsWith('0') && digits[1] === '5') return digits.slice(1);
+  // Accept: 5xxxxxxxxx (10)
+  if (digits.length === 10 && digits.startsWith('5')) return digits;
+  // Accept: 90 + 5xxxxxxxxx (12) or 905xxxxxxxxx (12) -> 5xxxxxxxxx
+  if (digits.length === 12 && digits.startsWith('90') && digits[2] === '5') return digits.slice(2);
+  // Fallback: return digits (can still be logged)
+  return digits;
+}
+
 function randOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+/* =======================
+ * UI
+ * ======================= */
+function kvkkPlaceholderHtml() {
+  return `
+  <strong>KVKK Aydınlatma Metni (Placeholder)</strong><br/>
+  Bu metin şimdilik örnektir. Gerçek metin daha sonra eklenecek.<br/><br/>
+  İşlenen veriler: Ad, Soyad, Telefon, MAC, IP, zaman damgaları.<br/>
+  Amaç: Misafir internet erişimi + 5651 loglama.<br/>
+  Versiyon: ${ENV.KVKK_VERSION}
+  `;
 }
 
 function renderPage(title, inner) {
@@ -202,10 +258,12 @@ function renderPage(title, inner) {
   <title>${title}</title>
   <style>
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1220;color:#111;padding:22px}
-    .card{max-width:460px;margin:0 auto;background:#fff;border-radius:18px;padding:18px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
+    .card{max-width:520px;margin:0 auto;background:#fff;border-radius:18px;padding:18px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
+    h2{margin:0 0 6px 0}
     .mut{color:#6b7280;font-size:12px}
     input,button{width:100%;padding:12px 12px;border-radius:12px;border:1px solid #d1d5db;font-size:14px}
-    button{border:0;background:#4f46e5;color:#fff;font-weight:700;cursor:pointer;margin-top:10px}
+    button{border:0;background:#4f46e5;color:#fff;font-weight:800;cursor:pointer;margin-top:12px}
+    button:disabled{opacity:.7;cursor:not-allowed}
     .otp{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:34px;letter-spacing:4px;font-weight:900;
          text-align:center;padding:10px;border:1px dashed #9ca3af;border-radius:14px;background:#f9fafb;margin:10px 0}
     .ok{background:#ecfdf5;border:1px solid #86efac;color:#166534;padding:10px;border-radius:12px;margin-top:10px}
@@ -213,32 +271,27 @@ function renderPage(title, inner) {
     .row{display:flex;gap:10px}
     .row>div{flex:1}
     label{display:block;margin-top:10px;margin-bottom:6px;font-size:13px;color:#374151}
-    .kvkk{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;max-height:160px;overflow:auto;font-size:12px;color:#4b5563}
+    .kvkk{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;max-height:170px;overflow:auto;font-size:12px;color:#4b5563}
+    .topline{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .badge{font-size:11px;color:#111;background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:6px 10px}
   </style>
   </head><body><div class="card">${logo}${inner}</div></body></html>`;
 }
 
-function kvkkPlaceholderHtml() {
-  return `
-  <strong>KVKK Metni (Placeholder)</strong><br/>
-  Bu metin şimdilik örnektir. Gerçek metin daha sonra eklenecek.<br/><br/>
-  İşlenen veriler: Ad, Soyad, Telefon, MAC, IP, zaman damgaları.<br/>
-  Amaç: Misafir internet erişimi + 5651 loglama.<br/>
-  Versiyon: ${ENV.KVKK_VERSION}
-  `;
-}
-
 /* =======================
  * Grant URL builder
+ * - MUST be client-side redirect (network-auth cookie/session requirement)
  * ======================= */
-function buildGrantUrl(baseGrantUrl, rawQuery) {
+function buildGrantUrl(baseGrantUrl, rawQuery, continueUrl) {
   const q = new URLSearchParams(rawQuery);
 
-  // Remove things that can break parsing or shouldn't be repeated
+  // keep required params (gateway_id/node_id/client_ip/client_mac/node_mac/...)
   q.delete('user_continue_url');
-  q.delete('continue_url');
-  q.delete('duration');
   q.delete('base_grant_url');
+  q.delete('duration');
+
+  // be safe: include continue_url (some deployments need it)
+  if (continueUrl) q.set('continue_url', continueUrl);
 
   const qs = q.toString();
   if (!qs) return baseGrantUrl;
@@ -263,7 +316,11 @@ app.get('/', async (req, res) => {
   });
 
   if (!m.baseGrantUrl || !m.clientMac) {
-    return res.status(400).send(renderPage('Hata', `<h3>Eksik parametre</h3><div class="err">base_grant_url / client_mac yok.</div>`));
+    await logDb('SPLASH_BAD_REQUEST', { meta: { missing: true, q: req.query || {} } });
+    return res.status(400).send(renderPage('Hata', `
+      <h2>Eksik parametre</h2>
+      <div class="err">base_grant_url / client_mac yok. Bu sayfa Meraki Splash üzerinden açılmalı.</div>
+    `));
   }
 
   const sk = sessKey(m.clientMac);
@@ -280,17 +337,30 @@ app.get('/', async (req, res) => {
   });
 
   res.send(renderPage('Giriş', `
-    <h2 style="margin:0 0 6px 0">${safeStr(ENV.BRAND_NAME,60)}</h2>
-    <div class="mut">Misafir internet erişimi</div>
+    <div class="topline">
+      <div>
+        <h2>${safeStr(ENV.BRAND_NAME,60)}</h2>
+        <div class="mut">Misafir internet erişimi</div>
+      </div>
+      <div class="badge">KVKK ${ENV.KVKK_VERSION}</div>
+    </div>
 
-    <form method="POST" action="/start" style="margin-top:12px">
+    <form method="POST" action="/start" style="margin-top:14px" onsubmit="document.getElementById('btn').disabled=true;">
       <input type="hidden" name="client_mac" value="${m.clientMac}"/>
 
-      <label>Ad Soyad</label>
-      <input name="full_name" required maxlength="120"/>
+      <div class="row">
+        <div>
+          <label>Ad</label>
+          <input name="first_name" required maxlength="50" autocomplete="given-name"/>
+        </div>
+        <div>
+          <label>Soyad</label>
+          <input name="last_name" required maxlength="50" autocomplete="family-name"/>
+        </div>
+      </div>
 
       <label>Cep telefonu</label>
-      <input name="phone" required maxlength="25" placeholder="05xx..." inputmode="tel"/>
+      <input name="phone" required maxlength="25" placeholder="05xx..." inputmode="tel" autocomplete="tel"/>
 
       <label>KVKK</label>
       <div class="kvkk">${kvkkPlaceholderHtml()}</div>
@@ -300,32 +370,74 @@ app.get('/', async (req, res) => {
         <span class="mut" style="font-size:13px;color:#374151">KVKK metnini okudum ve kabul ediyorum.</span>
       </label>
 
-      <button type="submit">Devam et</button>
+      <button id="btn" type="submit">Devam et</button>
+      <div class="mut" style="margin-top:8px">Doğrulama kodu şimdilik ekranda gösterilir (SMS sonra).</div>
     </form>
   `));
 });
 
 app.post('/start', async (req, res) => {
   const client_mac = safeStr(req.body.client_mac, 64).toLowerCase();
-  const full_name = safeStr(req.body.full_name, 120).trim();
-  const phone = safeStr(req.body.phone, 25).trim();
+  const first_name = safeStr(req.body.first_name, 50).trim();
+  const last_name = safeStr(req.body.last_name, 50).trim();
+  const phone_raw = safeStr(req.body.phone, 25).trim();
+  const phone = normalizePhoneTR(phone_raw);
   const kvkk_accepted = req.body.kvkk_accepted === '1';
 
   const sk = sessKey(client_mac);
   const sess = await kvGet(sk);
   if (!sess?.meraki?.baseGrantUrl) {
-    return res.status(400).send(renderPage('Hata', `<h3>Oturum yok</h3><div class="err">Tekrar başlayın.</div>`));
+    await logDb('START_NO_SESSION', { client_mac, meta: { reason: 'no_session' } });
+    return res.status(400).send(renderPage('Hata', `<h2>Oturum bulunamadı</h2><div class="err">Lütfen tekrar deneyin.</div>`));
+  }
+
+  // Lock check (brute protection)
+  const locked = await kvGet(lockKey(client_mac));
+  if (locked) {
+    return res.status(429).send(renderPage('Kilitli', `
+      <h2>Çok fazla deneme</h2>
+      <div class="err">Lütfen biraz bekleyip tekrar deneyin.</div>
+    `));
+  }
+
+  // Rate-limit OTP creation (MAC + phone)
+  const macOk = await kvSetNX(rlMacKey(client_mac), '1', ENV.RL_MAC_SECONDS);
+  const phOk = await kvSetNX(rlPhoneKey(phone || phone_raw), '1', ENV.RL_PHONE_SECONDS);
+  if (!macOk || !phOk) {
+    await logDb('OTP_RATE_LIMIT', {
+      client_mac,
+      client_ip: sess.meraki.clientIp,
+      ssid: sess.meraki.ssid,
+      ap_name: sess.meraki.apName,
+      base_grant_url: sess.meraki.baseGrantUrl,
+      continue_url: sess.meraki.continueUrl,
+      meta: { by: !macOk ? 'mac' : 'phone' }
+    });
+    return res.status(429).send(renderPage('Yavaş', `
+      <h2>Çok hızlı deneme</h2>
+      <div class="err">Lütfen ${!macOk ? ENV.RL_MAC_SECONDS : ENV.RL_PHONE_SECONDS} saniye bekleyip tekrar deneyin.</div>
+    `));
   }
 
   const otp = randOtp();
   const marker = String(Math.floor(100000 + Math.random() * 900000));
+  const full_name = `${first_name} ${last_name}`.trim();
 
-  sess.user = { full_name, phone, kvkk_accepted: !!kvkk_accepted, kvkk_version: ENV.KVKK_VERSION };
-  sess.otp = { otp, marker, expiresAt: Date.now() + ENV.OTP_TTL_SECONDS * 1000 };
+  sess.user = { first_name, last_name, full_name, phone, phone_raw, kvkk_accepted: !!kvkk_accepted, kvkk_version: ENV.KVKK_VERSION };
+  sess.otp = {
+    value: otp,
+    marker,
+    wrong: 0,
+    expiresAt: Date.now() + ENV.OTP_TTL_SECONDS * 1000
+  };
 
   await kvSet(sk, sess, ENV.OTP_TTL_SECONDS);
 
-  console.log('OTP_CREATED', { marker, last4: phone.slice(-4), client_mac });
+  console.log('OTP_CREATED', {
+    marker,
+    last4: (phone || phone_raw).slice(-4),
+    client_mac
+  });
 
   await logDb('OTP_CREATED', {
     client_mac,
@@ -336,20 +448,23 @@ app.post('/start', async (req, res) => {
     continue_url: sess.meraki.continueUrl,
     marker,
     phone,
-    full_name
+    full_name,
+    kvkk_version: ENV.KVKK_VERSION
   });
 
+  // OTP mode screen (SMS later)
   res.send(renderPage('OTP', `
-    <h2 style="margin:0 0 6px 0">Doğrulama</h2>
+    <h2>Doğrulama</h2>
     <div class="mut">SMS kapalı. Kod ekranda gösteriliyor.</div>
     <div class="otp">${otp}</div>
 
-    <form method="POST" action="/verify">
+    <form method="POST" action="/verify" onsubmit="document.getElementById('btn2').disabled=true;">
       <input type="hidden" name="client_mac" value="${client_mac}"/>
       <label>Kodu girin</label>
-      <input name="otp" required inputmode="numeric" maxlength="10"/>
-      <button type="submit">Doğrula ve Bağlan</button>
+      <input name="otp" required inputmode="numeric" maxlength="10" autocomplete="one-time-code"/>
+      <button id="btn2" type="submit">Doğrula ve Bağlan</button>
     </form>
+    <div class="mut" style="margin-top:10px">Kod süresi: ${ENV.OTP_TTL_SECONDS} saniye.</div>
   `));
 });
 
@@ -359,19 +474,54 @@ app.post('/verify', async (req, res) => {
 
   const sk = sessKey(client_mac);
   const sess = await kvGet(sk);
-  if (!sess?.otp?.otp || !sess?.meraki?.baseGrantUrl) {
-    return res.status(400).send(renderPage('Hata', `<h3>Oturum yok</h3><div class="err">Tekrar başlayın.</div>`));
+  if (!sess?.otp?.value || !sess?.meraki?.baseGrantUrl) {
+    await logDb('VERIFY_NO_SESSION', { client_mac, meta: { reason: 'no_session_or_otp' } });
+    return res.status(400).send(renderPage('Hata', `<h2>Oturum yok</h2><div class="err">Lütfen tekrar başlayın.</div>`));
   }
 
   if (Date.now() > sess.otp.expiresAt) {
+    await logDb('OTP_EXPIRED', {
+      client_mac,
+      client_ip: sess.meraki.clientIp,
+      marker: sess.otp.marker
+    });
     await kvDel(sk);
-    return res.status(400).send(renderPage('Süre doldu', `<h3>Kod süresi doldu</h3><div class="err">Tekrar deneyin.</div>`));
+    return res.status(400).send(renderPage('Süre doldu', `<h2>Kod süresi doldu</h2><div class="err">Lütfen tekrar deneyin.</div>`));
   }
 
-  if (otp_in !== sess.otp.otp) {
-    return res.status(401).send(renderPage('Hatalı', `<h3>Hatalı OTP</h3><div class="err">Tekrar deneyin.</div>`));
+  if (otp_in !== sess.otp.value) {
+    sess.otp.wrong = Number(sess.otp.wrong || 0) + 1;
+
+    await logDb('OTP_WRONG', {
+      client_mac,
+      client_ip: sess.meraki.clientIp,
+      marker: sess.otp.marker,
+      meta: { wrong: sess.otp.wrong }
+    });
+
+    if (sess.otp.wrong >= ENV.MAX_WRONG_ATTEMPTS) {
+      await kvSet(lockKey(client_mac), { at: Date.now() }, ENV.LOCK_SECONDS);
+      await kvDel(sk);
+      return res.status(429).send(renderPage('Kilitli', `
+        <h2>Çok fazla hatalı deneme</h2>
+        <div class="err">${ENV.LOCK_SECONDS} saniye kilitlendi.</div>
+      `));
+    }
+
+    await kvSet(sk, sess, Math.ceil((sess.otp.expiresAt - Date.now()) / 1000));
+    return res.status(401).send(renderPage('Hatalı', `
+      <h2>Hatalı kod</h2>
+      <div class="err">Tekrar deneyin. (${sess.otp.wrong}/${ENV.MAX_WRONG_ATTEMPTS})</div>
+      <form method="POST" action="/verify" onsubmit="document.getElementById('btn3').disabled=true;">
+        <input type="hidden" name="client_mac" value="${client_mac}"/>
+        <label>Kodu girin</label>
+        <input name="otp" required inputmode="numeric" maxlength="10" autocomplete="one-time-code"/>
+        <button id="btn3" type="submit">Tekrar Doğrula</button>
+      </form>
+    `));
   }
 
+  // OTP OK
   console.log('OTP_VERIFY_OK', { marker: sess.otp.marker, client_mac });
 
   await logDb('OTP_VERIFIED', {
@@ -383,32 +533,35 @@ app.post('/verify', async (req, res) => {
     continue_url: sess.meraki.continueUrl,
     marker: sess.otp.marker,
     phone: sess.user?.phone,
-    full_name: sess.user?.full_name
+    full_name: sess.user?.full_name,
+    kvkk_version: ENV.KVKK_VERSION
   });
 
-  // IMPORTANT FIX:
-  // network-auth.com grant returns 400 when called server-side (needs browser session/cookies).
-  // So we redirect the CLIENT browser to grantUrl.
-  const grantUrl = buildGrantUrl(sess.meraki.baseGrantUrl, sess.meraki.rawQuery);
+  // IMPORTANT: client-side redirect (network-auth cookie/session requirement)
+  const grantUrl = buildGrantUrl(sess.meraki.baseGrantUrl, sess.meraki.rawQuery, sess.meraki.continueUrl);
 
   console.log('GRANT_CLIENT_REDIRECT:', grantUrl);
 
   await logDb('GRANT_CLIENT_REDIRECT', {
     client_mac,
     client_ip: sess.meraki.clientIp,
+    ssid: sess.meraki.ssid,
+    ap_name: sess.meraki.apName,
     base_grant_url: sess.meraki.baseGrantUrl,
     continue_url: sess.meraki.continueUrl,
     marker: sess.otp.marker,
+    phone: sess.user?.phone,
+    full_name: sess.user?.full_name,
     meta: { grantUrl }
   });
 
-  // cleanup (optional)
+  // end session (for privacy)
   await kvDel(sk);
 
   const cont = sess.meraki.continueUrl || 'http://example.com';
 
   return res.status(200).send(renderPage('Bağlanıyor', `
-    <h3>Bağlanılıyor…</h3>
+    <h2>Bağlanılıyor…</h2>
     <div class="ok">İzin veriliyor (Meraki Grant).</div>
     <div class="mut">Yönlendirme olmazsa 2 saniye içinde devam sayfasına geçeceğiz.</div>
 
