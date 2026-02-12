@@ -1,92 +1,106 @@
 // smsService.js (ESM)
+// İletiMerkezi SMS gönderimi + TR MSISDN normalize
 
-import { URLSearchParams } from "url";
+const ILETIMERKEZI_URL =
+  process.env.ILETIMERKEZI_URL ||
+  "https://api.iletimerkezi.com/v1/send-sms"; // sizde farklıysa ENV ile override edin
 
-const ILETI_KEY = process.env.ILETI_KEY || "";
-const ILETI_HASH = process.env.ILETI_HASH || "";
-const ILETI_SENDER = process.env.ILETI_SENDER || ""; // örn: APITEST
-
-function requireEnv() {
-  const missing = [];
-  if (!ILETI_KEY) missing.push("ILETI_KEY");
-  if (!ILETI_HASH) missing.push("ILETI_HASH");
-  if (!ILETI_SENDER) missing.push("ILETI_SENDER");
-  if (missing.length) {
-    throw new Error(`Missing env vars: ${missing.join(", ")}`);
-  }
+function onlyDigits(s) {
+  return String(s || "").replace(/\D/g, "");
 }
 
+// Kullanıcı: 0533..., +90533..., 90533..., 533... => API'ye: 533...
 export function normalizeTrMsisdn(input) {
-  let s = String(input || "").trim().replace(/\D/g, "");
-  if (s.startsWith("90")) s = s.slice(2);
-  if (s.startsWith("0")) s = s.slice(1);
-  return /^5\d{9}$/.test(s) ? s : null;
+  const raw = String(input || "").trim();
+  let d = onlyDigits(raw);
+
+  if (!d) return "";
+
+  // +90 / 90 / 0 prefix düzeltmeleri
+  if (d.startsWith("90") && d.length >= 12) d = d.slice(2);
+  if (d.startsWith("0") && d.length === 11) d = d.slice(1);
+
+  // 10 hane olmalı ve 5 ile başlamalı (TR GSM)
+  if (!/^5\d{9}$/.test(d)) return "";
+
+  return d;
 }
 
-function extractXmlTag(xml, tag) {
-  // basit XML tag extractor (dış bağımlılık yok)
-  const re = new RegExp(`<${tag}>([^<]+)</${tag}>`);
-  const m = xml.match(re);
-  return m ? m[1] : null;
+function escapeXml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function parseIletiXml(xml) {
+  // Minimal parse: <code>200</code>, <message>...</message>, <id>...</id>
+  const code = (xml.match(/<code>(\d+)<\/code>/) || [])[1] || null;
+  const message = (xml.match(/<message>([\s\S]*?)<\/message>/) || [])[1] || null;
+  const orderId = (xml.match(/<id>(\d+)<\/id>/) || [])[1] || null;
+  return { code: code ? Number(code) : null, message: message ? message.trim() : null, orderId };
 }
 
 export async function sendOtpSms({ phone, text }) {
-  requireEnv();
+  const key = process.env.ILETI_KEY || "";
+  const hash = process.env.ILETI_HASH || "";
+  const sender = process.env.ILETI_SENDER || "";
+
+  if (!key || !hash || !sender) {
+    return { ok: false, error: "ENV_MISSING", code: null, message: "ILETI_KEY/ILETI_HASH/ILETI_SENDER missing" };
+  }
 
   const msisdn = normalizeTrMsisdn(phone);
   if (!msisdn) {
+    return { ok: false, error: "INVALID_MSISDN", code: null, message: "Invalid MSISDN" };
+  }
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<request>
+  <authentication>
+    <key>${escapeXml(key)}</key>
+    <hash>${escapeXml(hash)}</hash>
+  </authentication>
+  <order>
+    <sender>${escapeXml(sender)}</sender>
+    <message>
+      <text>${escapeXml(text)}</text>
+      <receipents>
+        <number>${escapeXml(msisdn)}</number>
+      </receipents>
+    </message>
+  </order>
+</request>`;
+
+  let respText = "";
+  try {
+    const r = await fetch(ILETIMERKEZI_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/xml; charset=UTF-8"
+      },
+      body: xml
+    });
+
+    respText = await r.text();
+
+    const parsed = parseIletiXml(respText);
+    const code = parsed.code;
+
+    if (code === 200) {
+      return { ok: true, orderId: parsed.orderId || null };
+    }
+
     return {
       ok: false,
-      error: "INVALID_PHONE_FORMAT",
-      detail: "Expected TR GSM like 5XXXXXXXXX (10 digits).",
+      error: "ILETIMERKEZI_ERROR",
+      code,
+      message: parsed.message || "Unknown error",
+      raw: respText
     };
-  }
-
-  if (!text || typeof text !== "string" || text.trim().length === 0) {
-    return { ok: false, error: "EMPTY_TEXT" };
-  }
-
-  // İletiMerkezi GET endpoint
-  const params = new URLSearchParams({
-    key: ILETI_KEY,
-    hash: ILETI_HASH,
-    text: text,
-    receipents: msisdn,     // DOĞRU param adı
-    sender: ILETI_SENDER,   // onaylı başlık (APITEST)
-    iys: "1",
-    iysList: "BIREYSEL",
-  });
-
-  const url = `https://api.iletimerkezi.com/v1/send-sms/get/?${params.toString()}`;
-
-  let res;
-  let body;
-  try {
-    res = await fetch(url, { method: "GET", redirect: "follow" });
-    body = await res.text();
   } catch (e) {
-    return { ok: false, error: "NETWORK_ERROR", detail: e?.message || String(e) };
+    return { ok: false, error: "NETWORK_ERROR", code: null, message: e?.message || String(e), raw: respText };
   }
-
-  const code = extractXmlTag(body, "code") || String(res.status);
-  const message = extractXmlTag(body, "message") || null;
-  const orderId = extractXmlTag(body, "id") || null;
-
-  if (String(code) === "200") {
-    return { ok: true, code: 200, orderId };
-  }
-
-  // Yaygın hatalar için etiketleme (opsiyonel)
-  const mapped =
-    String(code) === "450" ? "SENDER_NOT_ALLOWED" :
-    String(code) === "452" ? "INVALID_RECEIPENTS" :
-    String(code) === "401" ? "UNAUTHORIZED_OR_IP_RESTRICTED" :
-    "ILETIMERKEZI_ERROR";
-
-  return {
-    ok: false,
-    error: mapped,
-    code: Number.isFinite(Number(code)) ? Number(code) : code,
-    message,
-  };
 }
