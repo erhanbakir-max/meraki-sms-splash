@@ -1,23 +1,5 @@
 'use strict';
 
-/**
- * Meraki Guest Splash (OTP screen) + KVKK placeholder + 5651 event logging (Postgres)
- * + Redis session store + client-side Meraki grant redirect (fixes eu.network-auth.com 400)
- *
- * Required ENV (Railway):
- * - REDIS_URL (or REDIS_PUBLIC_URL)
- * - DATABASE_URL (Railway Postgres)
- * Optional:
- * - BRAND_NAME
- * - COMPANY_LOGO_URL
- * - KVKK_VERSION
- * - OTP_TTL_SECONDS
- * - MAX_WRONG_ATTEMPTS
- * - LOCK_SECONDS
- * - RL_MAC_SECONDS
- * - RL_PHONE_SECONDS
- */
-
 const express = require('express');
 const crypto = require('crypto');
 const { Pool } = require('pg');
@@ -36,13 +18,12 @@ app.use(express.json());
 const ENV = {
   PORT: Number(process.env.PORT || 8080),
 
-  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(), // screen only for now
+  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(),
   OTP_TTL_SECONDS: Number(process.env.OTP_TTL_SECONDS || 180),
 
   MAX_WRONG_ATTEMPTS: Number(process.env.MAX_WRONG_ATTEMPTS || 5),
   LOCK_SECONDS: Number(process.env.LOCK_SECONDS || 600),
 
-  // simple rate limits (OTP creation)
   RL_MAC_SECONDS: Number(process.env.RL_MAC_SECONDS || 30),
   RL_PHONE_SECONDS: Number(process.env.RL_PHONE_SECONDS || 60),
 
@@ -53,6 +34,9 @@ const ENV = {
 
   REDIS_URL: process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || '',
   DATABASE_URL: process.env.DATABASE_URL || '',
+
+  // Public IP cache
+  PUBLIC_IP_REFRESH_SECONDS: Number(process.env.PUBLIC_IP_REFRESH_SECONDS || 3600),
 };
 
 console.log('ENV:', {
@@ -98,7 +82,6 @@ async function kvDel(key) {
 }
 async function kvSetNX(key, value, ttlSeconds) {
   if (!redisReady) return false;
-  // SET key value NX EX ttl
   const ok = await redis.set(key, value, { NX: true, EX: ttlSeconds });
   return ok === 'OK';
 }
@@ -112,7 +95,7 @@ function rlPhoneKey(phone) { return `rl:ph:${hashShort(phone)}`; }
 function lockKey(mac) { return `lock:${hashShort(mac)}`; }
 
 /* =======================
- * POSTGRES (5651 logs) + auto migration
+ * POSTGRES (5651 logs) + migration
  * ======================= */
 const pool = ENV.DATABASE_URL ? new Pool({ connectionString: ENV.DATABASE_URL }) : null;
 
@@ -124,7 +107,6 @@ async function initDatabase() {
   await pool.query('SELECT 1');
   console.log('DATABASE: connected');
 
-  // Create base table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_logs (
       id BIGSERIAL PRIMARY KEY,
@@ -144,7 +126,6 @@ async function initDatabase() {
     );
   `);
 
-  // Safe migrations for older schema
   const alters = [
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_mac TEXT;`,
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_ip TEXT;`,
@@ -158,9 +139,7 @@ async function initDatabase() {
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS kvkk_version TEXT;`,
     `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS meta JSONB;`,
   ];
-  for (const sql of alters) {
-    try { await pool.query(sql); } catch (e) { /* ignore */ }
-  }
+  for (const sql of alters) { try { await pool.query(sql); } catch (_) {} }
 
   console.log('DATABASE: table ready');
 }
@@ -192,6 +171,37 @@ async function logDb(event, data = {}) {
 }
 
 /* =======================
+ * Public IP (cached)
+ * ======================= */
+let cachedPublicIp = '';
+let cachedPublicIpAt = 0;
+
+async function fetchPublicIp() {
+  try {
+    // /ip returns plain text IP; avoids HTML noise
+    const r = await fetch('https://ifconfig.me/ip', { method: 'GET' });
+    const t = (await r.text()).trim();
+    // naive validation
+    if (t && t.length < 64) return t;
+  } catch (_) {}
+  return '';
+}
+
+async function getPublicIpCached() {
+  const now = Date.now();
+  if (cachedPublicIp && (now - cachedPublicIpAt) < ENV.PUBLIC_IP_REFRESH_SECONDS * 1000) {
+    return cachedPublicIp;
+  }
+  const ip = await fetchPublicIp();
+  if (ip) {
+    cachedPublicIp = ip;
+    cachedPublicIpAt = now;
+    console.log('PUBLIC_IP:', cachedPublicIp);
+  }
+  return cachedPublicIp || '';
+}
+
+/* =======================
  * Helpers
  * ======================= */
 function safeStr(x, max = 1600) {
@@ -204,6 +214,14 @@ function getClientIp(req, q) {
   const xf = req.headers['x-forwarded-for'];
   const fromHeader = (typeof xf === 'string' && xf.length) ? xf.split(',')[0].trim() : '';
   return safeStr(q?.client_ip || fromHeader || req.ip || '');
+}
+
+function requestMeta(req) {
+  return {
+    user_agent: safeStr(req.headers['user-agent'] || '', 400),
+    accept_language: safeStr(req.headers['accept-language'] || '', 120),
+    referer: safeStr(req.headers['referer'] || '', 400),
+  };
 }
 
 function parseMeraki(req) {
@@ -219,16 +237,11 @@ function parseMeraki(req) {
   };
 }
 
-// Store phone in a consistent way for logs (KVKK/5651). (Not for SMS yet.)
 function normalizePhoneTR(input) {
   const digits = (input || '').replace(/[^\d]/g, '');
-  // Accept: 05xxxxxxxxx (11) -> 5xxxxxxxxx
   if (digits.length === 11 && digits.startsWith('0') && digits[1] === '5') return digits.slice(1);
-  // Accept: 5xxxxxxxxx (10)
   if (digits.length === 10 && digits.startsWith('5')) return digits;
-  // Accept: 90 + 5xxxxxxxxx (12) or 905xxxxxxxxx (12) -> 5xxxxxxxxx
   if (digits.length === 12 && digits.startsWith('90') && digits[2] === '5') return digits.slice(2);
-  // Fallback: return digits (can still be logged)
   return digits;
 }
 
@@ -280,22 +293,15 @@ function renderPage(title, inner) {
 
 /* =======================
  * Grant URL builder
- * - MUST be client-side redirect (network-auth cookie/session requirement)
  * ======================= */
 function buildGrantUrl(baseGrantUrl, rawQuery, continueUrl) {
   const q = new URLSearchParams(rawQuery);
-
-  // keep required params (gateway_id/node_id/client_ip/client_mac/node_mac/...)
   q.delete('user_continue_url');
   q.delete('base_grant_url');
   q.delete('duration');
-
-  // be safe: include continue_url (some deployments need it)
   if (continueUrl) q.set('continue_url', continueUrl);
-
   const qs = q.toString();
   if (!qs) return baseGrantUrl;
-
   const glue = baseGrantUrl.includes('?') ? '&' : '?';
   return baseGrantUrl + glue + qs;
 }
@@ -303,10 +309,15 @@ function buildGrantUrl(baseGrantUrl, rawQuery, continueUrl) {
 /* =======================
  * Routes
  * ======================= */
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', async (req, res) => {
+  const publicIp = await getPublicIpCached();
+  res.json({ ok: true, public_ip: publicIp || null });
+});
 
 app.get('/', async (req, res) => {
   const m = parseMeraki(req);
+  const metaReq = requestMeta(req);
+  const publicIp = await getPublicIpCached();
 
   console.log('SPLASH_OPEN', {
     hasBaseGrant: !!m.baseGrantUrl,
@@ -316,7 +327,7 @@ app.get('/', async (req, res) => {
   });
 
   if (!m.baseGrantUrl || !m.clientMac) {
-    await logDb('SPLASH_BAD_REQUEST', { meta: { missing: true, q: req.query || {} } });
+    await logDb('SPLASH_BAD_REQUEST', { meta: { missing: true, q: req.query || {}, ...metaReq, public_ip: publicIp } });
     return res.status(400).send(renderPage('Hata', `
       <h2>Eksik parametre</h2>
       <div class="err">base_grant_url / client_mac yok. Bu sayfa Meraki Splash üzerinden açılmalı.</div>
@@ -333,7 +344,7 @@ app.get('/', async (req, res) => {
     ap_name: m.apName,
     base_grant_url: m.baseGrantUrl,
     continue_url: m.continueUrl,
-    meta: { rawQuery_len: m.rawQuery.length }
+    meta: { rawQuery_len: m.rawQuery.length, ...metaReq, public_ip: publicIp }
   });
 
   res.send(renderPage('Giriş', `
@@ -391,16 +402,14 @@ app.post('/start', async (req, res) => {
     return res.status(400).send(renderPage('Hata', `<h2>Oturum bulunamadı</h2><div class="err">Lütfen tekrar deneyin.</div>`));
   }
 
-  // Lock check (brute protection)
+  const metaReq = requestMeta(req);
+  const publicIp = await getPublicIpCached();
+
   const locked = await kvGet(lockKey(client_mac));
   if (locked) {
-    return res.status(429).send(renderPage('Kilitli', `
-      <h2>Çok fazla deneme</h2>
-      <div class="err">Lütfen biraz bekleyip tekrar deneyin.</div>
-    `));
+    return res.status(429).send(renderPage('Kilitli', `<h2>Çok fazla deneme</h2><div class="err">Lütfen biraz bekleyip tekrar deneyin.</div>`));
   }
 
-  // Rate-limit OTP creation (MAC + phone)
   const macOk = await kvSetNX(rlMacKey(client_mac), '1', ENV.RL_MAC_SECONDS);
   const phOk = await kvSetNX(rlPhoneKey(phone || phone_raw), '1', ENV.RL_PHONE_SECONDS);
   if (!macOk || !phOk) {
@@ -411,7 +420,7 @@ app.post('/start', async (req, res) => {
       ap_name: sess.meraki.apName,
       base_grant_url: sess.meraki.baseGrantUrl,
       continue_url: sess.meraki.continueUrl,
-      meta: { by: !macOk ? 'mac' : 'phone' }
+      meta: { by: !macOk ? 'mac' : 'phone', ...metaReq, public_ip: publicIp }
     });
     return res.status(429).send(renderPage('Yavaş', `
       <h2>Çok hızlı deneme</h2>
@@ -424,20 +433,11 @@ app.post('/start', async (req, res) => {
   const full_name = `${first_name} ${last_name}`.trim();
 
   sess.user = { first_name, last_name, full_name, phone, phone_raw, kvkk_accepted: !!kvkk_accepted, kvkk_version: ENV.KVKK_VERSION };
-  sess.otp = {
-    value: otp,
-    marker,
-    wrong: 0,
-    expiresAt: Date.now() + ENV.OTP_TTL_SECONDS * 1000
-  };
+  sess.otp = { value: otp, marker, wrong: 0, expiresAt: Date.now() + ENV.OTP_TTL_SECONDS * 1000 };
 
   await kvSet(sk, sess, ENV.OTP_TTL_SECONDS);
 
-  console.log('OTP_CREATED', {
-    marker,
-    last4: (phone || phone_raw).slice(-4),
-    client_mac
-  });
+  console.log('OTP_CREATED', { marker, last4: (phone || phone_raw).slice(-4), client_mac });
 
   await logDb('OTP_CREATED', {
     client_mac,
@@ -449,10 +449,10 @@ app.post('/start', async (req, res) => {
     marker,
     phone,
     full_name,
-    kvkk_version: ENV.KVKK_VERSION
+    kvkk_version: ENV.KVKK_VERSION,
+    meta: { ...metaReq, public_ip: publicIp }
   });
 
-  // OTP mode screen (SMS later)
   res.send(renderPage('OTP', `
     <h2>Doğrulama</h2>
     <div class="mut">SMS kapalı. Kod ekranda gösteriliyor.</div>
@@ -479,12 +479,11 @@ app.post('/verify', async (req, res) => {
     return res.status(400).send(renderPage('Hata', `<h2>Oturum yok</h2><div class="err">Lütfen tekrar başlayın.</div>`));
   }
 
+  const metaReq = requestMeta(req);
+  const publicIp = await getPublicIpCached();
+
   if (Date.now() > sess.otp.expiresAt) {
-    await logDb('OTP_EXPIRED', {
-      client_mac,
-      client_ip: sess.meraki.clientIp,
-      marker: sess.otp.marker
-    });
+    await logDb('OTP_EXPIRED', { client_mac, client_ip: sess.meraki.clientIp, marker: sess.otp.marker, meta: { ...metaReq, public_ip: publicIp } });
     await kvDel(sk);
     return res.status(400).send(renderPage('Süre doldu', `<h2>Kod süresi doldu</h2><div class="err">Lütfen tekrar deneyin.</div>`));
   }
@@ -492,20 +491,12 @@ app.post('/verify', async (req, res) => {
   if (otp_in !== sess.otp.value) {
     sess.otp.wrong = Number(sess.otp.wrong || 0) + 1;
 
-    await logDb('OTP_WRONG', {
-      client_mac,
-      client_ip: sess.meraki.clientIp,
-      marker: sess.otp.marker,
-      meta: { wrong: sess.otp.wrong }
-    });
+    await logDb('OTP_WRONG', { client_mac, client_ip: sess.meraki.clientIp, marker: sess.otp.marker, meta: { wrong: sess.otp.wrong, ...metaReq, public_ip: publicIp } });
 
     if (sess.otp.wrong >= ENV.MAX_WRONG_ATTEMPTS) {
       await kvSet(lockKey(client_mac), { at: Date.now() }, ENV.LOCK_SECONDS);
       await kvDel(sk);
-      return res.status(429).send(renderPage('Kilitli', `
-        <h2>Çok fazla hatalı deneme</h2>
-        <div class="err">${ENV.LOCK_SECONDS} saniye kilitlendi.</div>
-      `));
+      return res.status(429).send(renderPage('Kilitli', `<h2>Çok fazla hatalı deneme</h2><div class="err">${ENV.LOCK_SECONDS} saniye kilitlendi.</div>`));
     }
 
     await kvSet(sk, sess, Math.ceil((sess.otp.expiresAt - Date.now()) / 1000));
@@ -521,7 +512,6 @@ app.post('/verify', async (req, res) => {
     `));
   }
 
-  // OTP OK
   console.log('OTP_VERIFY_OK', { marker: sess.otp.marker, client_mac });
 
   await logDb('OTP_VERIFIED', {
@@ -534,12 +524,11 @@ app.post('/verify', async (req, res) => {
     marker: sess.otp.marker,
     phone: sess.user?.phone,
     full_name: sess.user?.full_name,
-    kvkk_version: ENV.KVKK_VERSION
+    kvkk_version: ENV.KVKK_VERSION,
+    meta: { ...metaReq, public_ip: publicIp }
   });
 
-  // IMPORTANT: client-side redirect (network-auth cookie/session requirement)
   const grantUrl = buildGrantUrl(sess.meraki.baseGrantUrl, sess.meraki.rawQuery, sess.meraki.continueUrl);
-
   console.log('GRANT_CLIENT_REDIRECT:', grantUrl);
 
   await logDb('GRANT_CLIENT_REDIRECT', {
@@ -552,10 +541,10 @@ app.post('/verify', async (req, res) => {
     marker: sess.otp.marker,
     phone: sess.user?.phone,
     full_name: sess.user?.full_name,
-    meta: { grantUrl }
+    kvkk_version: ENV.KVKK_VERSION,
+    meta: { grantUrl, ...metaReq, public_ip: publicIp }
   });
 
-  // end session (for privacy)
   await kvDel(sk);
 
   const cont = sess.meraki.continueUrl || 'http://example.com';
@@ -582,6 +571,7 @@ app.post('/verify', async (req, res) => {
 (async () => {
   await initDatabase();
   await initRedis();
+  await getPublicIpCached(); // warm cache
 
   app.listen(ENV.PORT, () => {
     console.log(`Server running on port ${ENV.PORT}`);
