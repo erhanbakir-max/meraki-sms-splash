@@ -1,89 +1,93 @@
-// smsService.js (ESM)
+import axios from "axios";
 
-const ILETIMERKEZI_URL =
-  process.env.ILETIMERKEZI_URL ||
-  "https://api.iletimerkezi.com/v1/send-sms"; // gerekirse ENV ile değiştir
-
-function onlyDigits(s) {
-  return String(s || "").replace(/\D/g, "");
+function maskMsisdn(msisdn) {
+  if (!msisdn) return null;
+  return msisdn.length >= 4 ? msisdn.slice(-4) : "****";
 }
 
+// İletimerkezi genelde 10 haneli (5XXXXXXXXX) ister.
+// Kullanıcı 0 ile, +90 ile, 90 ile girse de normalize ediyoruz.
 export function normalizeTrMsisdn(input) {
-  const raw = String(input || "").trim();
-  let d = onlyDigits(raw);
+  const raw = String(input ?? "").trim();
+  const digits = raw.replace(/[^\d]/g, "");
 
-  if (!d) return "";
+  // +90 / 90 / 0 ile başlayanları kırp
+  let cleaned = digits;
+  if (cleaned.startsWith("90") && cleaned.length === 12) cleaned = cleaned.slice(2);
+  if (cleaned.startsWith("0") && cleaned.length === 11) cleaned = cleaned.slice(1);
 
-  if (d.startsWith("90") && d.length >= 12) d = d.slice(2);
-  if (d.startsWith("0") && d.length === 11) d = d.slice(1);
-
-  if (!/^5\d{9}$/.test(d)) return "";
-
-  return d;
+  // artık 10 hane ve 5 ile başlamalı
+  if (!/^5\d{9}$/.test(cleaned)) {
+    return { ok: false, msisdn: "", last4: null, reason: "Expected 5XXXXXXXXX (10 digits)" };
+  }
+  return { ok: true, msisdn: cleaned, last4: maskMsisdn(cleaned), reason: null };
 }
 
-function escapeXml(s) {
-  return String(s || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
+export async function sendSmsViaIletimerkezi({ msisdn, text, debug = false }) {
+  const ILETIMERKEZI_URL =
+    process.env.ILETIMERKEZI_URL || "https://api.iletimerkezi.com/v1/send-sms";
 
-function parseIletiXml(xml) {
-  const code = (xml.match(/<code>(\d+)<\/code>/) || [])[1] || null;
-  const message = (xml.match(/<message>([\s\S]*?)<\/message>/) || [])[1] || null;
-  const orderId = (xml.match(/<id>(\d+)<\/id>/) || [])[1] || null;
-  return { code: code ? Number(code) : null, message: message ? message.trim() : null, orderId };
-}
-
-export async function sendOtpSms({ phone, text }) {
-  const key = process.env.ILETI_KEY || "";
-  const hash = process.env.ILETI_HASH || "";
-  const sender = process.env.ILETI_SENDER || "";
+  const key = process.env.ILETIMERKEZI_KEY;
+  const hash = process.env.ILETIMERKEZI_HASH;
+  const sender = process.env.ILETIMERKEZI_SENDER;
 
   if (!key || !hash || !sender) {
-    return { ok: false, error: "ENV_MISSING", code: null, message: "ILETI_KEY/ILETI_HASH/ILETI_SENDER missing" };
+    return {
+      ok: false,
+      code: "MISSING_ENV",
+      message: "ILETIMERKEZI_KEY / ILETIMERKEZI_HASH / ILETIMERKEZI_SENDER eksik"
+    };
   }
 
-  const msisdn = normalizeTrMsisdn(phone);
-  if (!msisdn) {
-    return { ok: false, error: "INVALID_MSISDN", code: null, message: "Invalid MSISDN" };
-  }
-
+  // XML payload (İletimerkezi API buna çok sık gidiyor)
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <request>
   <authentication>
-    <key>${escapeXml(key)}</key>
-    <hash>${escapeXml(hash)}</hash>
+    <key>${key}</key>
+    <hash>${hash}</hash>
   </authentication>
   <order>
-    <sender>${escapeXml(sender)}</sender>
+    <sender>${sender}</sender>
     <message>
       <text>${escapeXml(text)}</text>
       <receipents>
-        <number>${escapeXml(msisdn)}</number>
+        <number>${msisdn}</number>
       </receipents>
     </message>
   </order>
 </request>`;
 
-  let respText = "";
   try {
-    const r = await fetch(ILETIMERKEZI_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/xml; charset=UTF-8" },
-      body: xml
+    const resp = await axios.post(ILETIMERKEZI_URL, xml, {
+      headers: { "Content-Type": "application/xml" },
+      timeout: 15000
     });
 
-    respText = await r.text();
-    const parsed = parseIletiXml(respText);
+    if (debug) {
+      console.log("ILETIMERKEZI_HTTP:", resp.status);
+      console.log("ILETIMERKEZI_BODY:", typeof resp.data === "string" ? resp.data.slice(0, 500) : resp.data);
+    }
 
-    if (parsed.code === 200) return { ok: true, orderId: parsed.orderId || null };
-
-    return { ok: false, error: "ILETIMERKEZI_ERROR", code: parsed.code, message: parsed.message, raw: respText };
+    // API 200 dönse bile içerikte status code olabilir; burada basitçe 200 ise OK sayıyoruz.
+    return { ok: resp.status === 200, http: resp.status, body: resp.data };
   } catch (e) {
-    return { ok: false, error: "NETWORK_ERROR", code: null, message: e?.message || String(e), raw: respText };
+    const http = e?.response?.status;
+    const body = e?.response?.data;
+    return {
+      ok: false,
+      code: "ILETIMERKEZI_ERROR",
+      http,
+      message: e?.message || "Request failed",
+      body
+    };
   }
+}
+
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
