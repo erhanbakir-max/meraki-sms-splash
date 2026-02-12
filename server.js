@@ -16,7 +16,7 @@ const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase();
 const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 180); // 3 dk
 const OTP_RESEND_BLOCK_SECONDS = Number(process.env.OTP_RESEND_BLOCK_SECONDS || 60); // 60 sn
 
-// In-memory store (Redis sonra eklenebilir)
+// In-memory store (Redis sonraki adım)
 const otpStore = new Map(); // marker -> { otp, expMs, msisdn, last4, base, cont, mac }
 const resendStore = new Map(); // msisdn -> untilMs
 
@@ -164,7 +164,6 @@ app.post("/otp", async (req, res) => {
 
   console.log("OTP_CREATED", { marker, last4: msisdn.slice(-4), client_mac: client_mac || null });
 
-  // screen mode -> show code on page
   if (OTP_MODE === "screen") {
     const body = `
       <div class="ok">TEST MODU: Kodunuz <code style="font-size:20px">${otp}</code></div>
@@ -181,15 +180,13 @@ app.post("/otp", async (req, res) => {
     return res.status(200).send(render("Kod", body));
   }
 
-  // sms mode -> send sms (onay gelince)
+  // SMS modu (onay gelince)
   const smsText = `WiFi kodunuz: ${otp}`;
   const result = await sendOtpSms({ phone: msisdn, text: smsText });
 
   if (!result.ok) {
     console.log("OTP_SMS_FAILED", { marker, code: result.code, message: result.message });
-    return res
-      .status(502)
-      .send(render("Hata", `<div class="error">SMS gönderilemedi. Lütfen tekrar deneyin.</div>`));
+    return res.status(502).send(render("Hata", `<div class="error">SMS gönderilemedi.</div>`));
   }
 
   console.log("OTP_SMS_SENT", { marker, orderId: result.orderId || null });
@@ -219,12 +216,9 @@ app.post("/verify", (req, res) => {
     return res.status(400).send(render("Hata", `<div class="error">Kod bulunamadı veya süresi doldu.</div>`));
   }
 
-  // MAC binding: kayıtlı mac varsa ve gelen mac farklıysa reddet
   if (entry.mac && client_mac && entry.mac !== client_mac) {
     console.log("OTP_VERIFY_FAIL", { marker, reason: "MAC_MISMATCH", stored: entry.mac, got: client_mac });
-    return res
-      .status(403)
-      .send(render("Hata", `<div class="error">Cihaz doğrulaması başarısız (MAC uyuşmadı).</div>`));
+    return res.status(403).send(render("Hata", `<div class="error">MAC uyuşmadı.</div>`));
   }
 
   if (entry.otp !== entered) {
@@ -236,7 +230,6 @@ app.post("/verify", (req, res) => {
 
   console.log("OTP_VERIFY_OK", { marker, client_mac: client_mac || entry.mac || null });
 
-  // Meraki authorize redirect
   const redirectUrl = buildGrantUrl(entry.base_grant_url, entry.user_continue_url);
   return res.redirect(302, redirectUrl);
 });
@@ -244,28 +237,24 @@ app.post("/verify", (req, res) => {
 function buildGrantUrl(baseGrantUrl, continueUrl) {
   try {
     const u = new URL(baseGrantUrl);
-    if (continueUrl && !u.searchParams.get("continue_url")) {
-      u.searchParams.set("continue_url", continueUrl);
-    }
+    if (continueUrl && !u.searchParams.get("continue_url")) u.searchParams.set("continue_url", continueUrl);
     return u.toString();
   } catch {
     return baseGrantUrl || continueUrl || "/";
   }
 }
 
-// ---- start server ----
+// ---- start ----
 const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-// ---- SIGTERM fix: Railway restart "error" görüntüsünü temizle ----
+// ---- SIGTERM cleanup: Railway restart loglarını düzelt ----
 let shuttingDown = false;
-
 function fastExit(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`SHUTDOWN ${signal}`);
-  // Railway bazen beklemeden kesiyor; en temiz sonuç için hızlı çıkıyoruz
   try {
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
@@ -273,6 +262,5 @@ function fastExit(signal) {
     process.exit(0);
   }
 }
-
 process.on("SIGTERM", () => fastExit("SIGTERM"));
 process.on("SIGINT", () => fastExit("SIGINT"));
