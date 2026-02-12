@@ -1,857 +1,589 @@
-/* meraki-sms-splash - server.js
- * Features:
- * - Meraki Captive Portal (custom splash URL)
- * - OTP_MODE=screen (OTP shown on screen; SMS disabled)
- * - Redis store for OTP sessions (fallback memory store if Redis not set)
- * - Postgres (Railway) access_logs table auto-create + 5651-style logging
- * - KVKK placeholder HTML + mandatory consent checkbox
- * - Clean UI (single page)
- */
-
-'use strict';
-
-const express = require('express');
-const crypto = require('crypto');
-const { Pool } = require('pg');
-
-let redisCreateClient = null;
-try {
-  // optional dependency; if not installed you can remove redis usage
-  ({ createClient: redisCreateClient } = require('redis'));
-} catch (_) {
-  // ignore
-}
+// server.js
+import express from "express";
+import { createClient as createRedisClient } from "redis";
+import pg from "pg";
+import crypto from "crypto";
 
 const app = express();
-app.set('trust proxy', true);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-/** ---------------------------
- * ENV / CONFIG
- * --------------------------- */
+/** =========================
+ *  ENV (defaults)
+ *  ========================= */
 const ENV = {
   PORT: Number(process.env.PORT || 8080),
 
-  // OTP behavior
-  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(), // screen | sms (sms disabled for now)
+  OTP_MODE: (process.env.OTP_MODE || "screen").toLowerCase(), // screen | sms (sms sonra)
   OTP_TTL_SECONDS: Number(process.env.OTP_TTL_SECONDS || 180),
 
-  // Rate limits / lock
   RL_MAC_SECONDS: Number(process.env.RL_MAC_SECONDS || 30),
   RL_MSISDN_SECONDS: Number(process.env.RL_MSISDN_SECONDS || 60),
   MAX_WRONG_ATTEMPTS: Number(process.env.MAX_WRONG_ATTEMPTS || 5),
   LOCK_SECONDS: Number(process.env.LOCK_SECONDS || 600),
 
-  // Branding / UI
-  BRAND_NAME: process.env.BRAND_NAME || 'Guest Wi-Fi',
-  COMPANY_LOGO_URL: process.env.COMPANY_LOGO_URL || '', // optional
-  KVKK_VERSION: process.env.KVKK_VERSION || 'v0-placeholder',
+  KVKK_VERSION: process.env.KVKK_VERSION || "2026-02-12-placeholder",
+  LOGO_URL: process.env.LOGO_URL || "",
 
-  // Storage
-  REDIS_URL: process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || '',
-  DATABASE_URL: process.env.DATABASE_URL || '',
+  // Redis
+  REDIS_URL: process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || "",
 
-  // Optional: if you want to force allow even when meraki params missing (dev)
-  DEV_ALLOW_NO_MERAKI: (process.env.DEV_ALLOW_NO_MERAKI || '0') === '1',
+  // Postgres
+  DATABASE_URL: process.env.DATABASE_URL || process.env.POSTGRES_URL || ""
 };
 
-console.log('ENV:', {
+console.log("ENV:", {
   OTP_MODE: ENV.OTP_MODE,
   OTP_TTL_SECONDS: ENV.OTP_TTL_SECONDS,
   RL_MAC_SECONDS: ENV.RL_MAC_SECONDS,
   RL_MSISDN_SECONDS: ENV.RL_MSISDN_SECONDS,
   MAX_WRONG_ATTEMPTS: ENV.MAX_WRONG_ATTEMPTS,
   LOCK_SECONDS: ENV.LOCK_SECONDS,
-  KVKK_VERSION: ENV.KVKK_VERSION,
+  KVKK_VERSION: ENV.KVKK_VERSION
 });
 
-/** ---------------------------
- * REDIS (optional)
- * --------------------------- */
+/** =========================
+ *  Redis init
+ *  ========================= */
 let redis = null;
-let redisReady = false;
-
-// in-memory fallback store (works but NOT persistent)
-const memStore = new Map();
-
 async function initRedis() {
-  if (!ENV.REDIS_URL || !redisCreateClient) {
-    console.log('REDIS: not configured (REDIS_URL / REDIS_PUBLIC_URL missing). Using memory store.');
-    return;
-  }
-
-  try {
-    redis = redisCreateClient({ url: ENV.REDIS_URL });
-    redis.on('error', (e) => console.error('REDIS ERROR:', e?.message || e));
-    await redis.connect();
-    redisReady = true;
-    console.log('REDIS: connected');
-  } catch (e) {
-    console.error('REDIS: connect failed -> falling back to memory store:', e?.message || e);
-    redis = null;
-    redisReady = false;
-  }
-}
-
-async function kvSet(key, valueObj, ttlSeconds) {
-  const v = JSON.stringify(valueObj);
-  if (redisReady && redis) {
-    await redis.set(key, v, { EX: ttlSeconds });
-    return;
-  }
-  memStore.set(key, { v, exp: Date.now() + ttlSeconds * 1000 });
-}
-
-async function kvGet(key) {
-  if (redisReady && redis) {
-    const v = await redis.get(key);
-    return v ? JSON.parse(v) : null;
-  }
-  const item = memStore.get(key);
-  if (!item) return null;
-  if (Date.now() > item.exp) {
-    memStore.delete(key);
+  if (!ENV.REDIS_URL) {
+    console.log("REDIS: not configured (REDIS_URL / REDIS_PUBLIC_URL missing). Running WITHOUT persistent store.");
     return null;
   }
-  return JSON.parse(item.v);
+  redis = createRedisClient({ url: ENV.REDIS_URL });
+  redis.on("error", (e) => console.log("REDIS_ERROR", e?.message || e));
+  await redis.connect();
+  console.log("REDIS: connected");
+  return redis;
 }
 
-async function kvDel(key) {
-  if (redisReady && redis) {
-    await redis.del(key);
-    return;
+/** =========================
+ *  Postgres init + schema
+ *  ========================= */
+let db = null;
+async function initDb() {
+  if (!ENV.DATABASE_URL) {
+    console.log("DATABASE: not configured (DATABASE_URL missing). 5651 logs will be skipped.");
+    return null;
   }
-  memStore.delete(key);
+  const { Pool } = pg;
+  db = new Pool({ connectionString: ENV.DATABASE_URL });
+  await db.query("select 1");
+  console.log("DATABASE: connected");
+
+  // Minimal 5651-ish access log table
+  await db.query(`
+    create table if not exists access_logs (
+      id bigserial primary key,
+      created_at timestamptz not null default now(),
+
+      event text not null,              -- SPLASH_OPEN, OTP_CREATED, OTP_VERIFIED, GRANT_CALLED, GRANT_OK, GRANT_FAIL
+      client_mac text,
+      client_ip text,
+      ap_name text,
+      ssid text,
+
+      full_name text,
+      msisdn text,
+      kvkk_accepted boolean,
+      kvkk_version text,
+
+      marker text,
+      last4 text,
+
+      base_grant_url text,
+      continue_url text,
+
+      meta jsonb
+    );
+  `);
+  console.log("DATABASE: table ready");
+  return db;
 }
 
-/** ---------------------------
- * POSTGRES (optional but recommended)
- * --------------------------- */
-const pool = ENV.DATABASE_URL ? new Pool({ connectionString: ENV.DATABASE_URL }) : null;
-
-async function initDatabase() {
-  if (!pool) {
-    console.log('DATABASE: not configured (DATABASE_URL missing).');
-    return;
-  }
-
+async function logDb(event, payload = {}) {
   try {
-    await pool.query('SELECT 1');
-    console.log('DATABASE: connected');
+    if (!db) return;
+    const row = {
+      event,
+      client_mac: payload.client_mac || null,
+      client_ip: payload.client_ip || null,
+      ap_name: payload.ap_name || null,
+      ssid: payload.ssid || null,
+      full_name: payload.full_name || null,
+      msisdn: payload.msisdn || null,
+      kvkk_accepted: typeof payload.kvkk_accepted === "boolean" ? payload.kvkk_accepted : null,
+      kvkk_version: payload.kvkk_version || null,
+      marker: payload.marker || null,
+      last4: payload.last4 || null,
+      base_grant_url: payload.base_grant_url || null,
+      continue_url: payload.continue_url || null,
+      meta: payload.meta ? JSON.stringify(payload.meta) : JSON.stringify({})
+    };
 
-    // Basic access logs table (5651-style event logging)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS access_logs (
-        id BIGSERIAL PRIMARY KEY,
-        created_at TIMESTAMPTZ DEFAULT now(),
-        event TEXT DEFAULT 'LOGIN',
-        first_name TEXT,
-        last_name TEXT,
-        phone TEXT,
-        kvkk_accepted BOOLEAN DEFAULT false,
-        kvkk_version TEXT,
-        marker TEXT,
-        client_mac TEXT,
-        client_ip INET,
-        ssid TEXT,
-        ap_name TEXT,
-        base_grant_url TEXT,
-        user_continue_url TEXT,
-        user_agent TEXT,
-        extra JSONB
-      );
-    `);
-
-    // Helpful indexes
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_mac ON access_logs(client_mac);`);
-    console.log('DATABASE: table ready');
-  } catch (err) {
-    console.error('DATABASE ERROR:', err?.message || err);
-  }
-}
-
-async function logAccess(event, data) {
-  if (!pool) return;
-
-  const payload = {
-    event: event || 'LOGIN',
-    first_name: data.first_name || null,
-    last_name: data.last_name || null,
-    phone: data.phone || null,
-    kvkk_accepted: !!data.kvkk_accepted,
-    kvkk_version: data.kvkk_version || ENV.KVKK_VERSION,
-    marker: data.marker || null,
-    client_mac: data.client_mac || null,
-    client_ip: data.client_ip || null,
-    ssid: data.ssid || null,
-    ap_name: data.ap_name || null,
-    base_grant_url: data.base_grant_url || null,
-    user_continue_url: data.user_continue_url || null,
-    user_agent: data.user_agent || null,
-    extra: data.extra ? JSON.stringify(data.extra) : null,
-  };
-
-  try {
-    await pool.query(
+    await db.query(
       `
-      INSERT INTO access_logs (
-        event, first_name, last_name, phone, kvkk_accepted, kvkk_version,
-        marker, client_mac, client_ip, ssid, ap_name, base_grant_url, user_continue_url, user_agent, extra
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,
-        $7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb
-      )
+      insert into access_logs
+      (event, client_mac, client_ip, ap_name, ssid, full_name, msisdn, kvkk_accepted, kvkk_version, marker, last4, base_grant_url, continue_url, meta)
+      values
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
       `,
       [
-        payload.event,
-        payload.first_name,
-        payload.last_name,
-        payload.phone,
-        payload.kvkk_accepted,
-        payload.kvkk_version,
-        payload.marker,
-        payload.client_mac,
-        payload.client_ip,
-        payload.ssid,
-        payload.ap_name,
-        payload.base_grant_url,
-        payload.user_continue_url,
-        payload.user_agent,
-        payload.extra,
+        row.event,
+        row.client_mac,
+        row.client_ip,
+        row.ap_name,
+        row.ssid,
+        row.full_name,
+        row.msisdn,
+        row.kvkk_accepted,
+        row.kvkk_version,
+        row.marker,
+        row.last4,
+        row.base_grant_url,
+        row.continue_url,
+        row.meta
       ]
     );
   } catch (e) {
-    console.error('DB LOG ERROR:', e?.message || e);
+    console.log("DATABASE_LOG_FAIL", e?.message || e);
   }
 }
 
-/** ---------------------------
- * Helpers
- * --------------------------- */
-function randOtp() {
-  // 6 digits
-  return String(Math.floor(100000 + Math.random() * 900000));
+/** =========================
+ *  Helpers
+ *  ========================= */
+function pickContinueUrl(q) {
+  // Meraki bazen continue_url / user_continue_url kullanır.
+  return q.continue_url || q.user_continue_url || q.redirect || "";
+}
+function pickBaseGrantUrl(q) {
+  return q.base_grant_url || q.base_grant || "";
+}
+function getClientMac(q) {
+  return (q.client_mac || q.clientMac || "").toLowerCase();
+}
+function getClientIp(req, q) {
+  // Meraki query’de client_ip olabiliyor
+  const ip = q.client_ip || req.headers["x-forwarded-for"]?.toString()?.split(",")[0]?.trim() || req.socket?.remoteAddress || "";
+  return ip;
+}
+function makeOtp() {
+  // 6 digit
+  return String(crypto.randomInt(0, forEach = 1000000).toString().padStart(6, "0"));
+}
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
 }
 
-function maskPhone(phone) {
-  if (!phone) return '';
-  const digits = String(phone).replace(/\D/g, '');
-  if (digits.length < 4) return '****';
-  return '****' + digits.slice(-4);
+function otpKey(clientMac) {
+  return `otp:${clientMac}`;
+}
+function ctxKey(clientMac) {
+  return `ctx:${clientMac}`;
+}
+function lockKey(clientMac) {
+  return `lock:${clientMac}`;
+}
+function wrongKey(clientMac) {
+  return `wrong:${clientMac}`;
 }
 
-function getClientIp(req) {
-  const xf = req.headers['x-forwarded-for'];
-  if (typeof xf === 'string' && xf.length > 0) return xf.split(',')[0].trim();
-  return req.ip || null;
+async function isLocked(clientMac) {
+  if (!redis) return false;
+  const v = await redis.get(lockKey(clientMac));
+  return v === "1";
 }
 
-function safeStr(x, max = 512) {
-  if (x == null) return '';
-  const s = String(x);
-  return s.length > max ? s.slice(0, max) : s;
+async function incWrong(clientMac) {
+  if (!redis) return 0;
+  const k = wrongKey(clientMac);
+  const n = await redis.incr(k);
+  await redis.expire(k, ENV.LOCK_SECONDS);
+  if (n >= ENV.MAX_WRONG_ATTEMPTS) {
+    await redis.set(lockKey(clientMac), "1", { EX: ENV.LOCK_SECONDS });
+  }
+  return n;
 }
 
-function parseMerakiParams(req) {
-  // Meraki sends these as query params to the Custom Splash URL.
-  // Common ones: base_grant_url, user_continue_url, client_mac, client_ip, ssid_name, ap_name
+async function clearWrongAndLock(clientMac) {
+  if (!redis) return;
+  await redis.del(wrongKey(clientMac));
+  await redis.del(lockKey(clientMac));
+}
+
+async function saveCtx(clientMac, ctx) {
+  if (!redis) return;
+  await redis.set(ctxKey(clientMac), JSON.stringify(ctx), { EX: 60 * 60 }); // 1 saat
+}
+async function loadCtx(clientMac) {
+  if (!redis) return null;
+  const v = await redis.get(ctxKey(clientMac));
+  return v ? JSON.parse(v) : null;
+}
+
+async function saveOtp(clientMac, otpObj) {
+  if (!redis) return;
+  await redis.set(otpKey(clientMac), JSON.stringify(otpObj), { EX: ENV.OTP_TTL_SECONDS });
+}
+async function loadOtp(clientMac) {
+  if (!redis) return null;
+  const v = await redis.get(otpKey(clientMac));
+  return v ? JSON.parse(v) : null;
+}
+async function clearOtp(clientMac) {
+  if (!redis) return;
+  await redis.del(otpKey(clientMac));
+}
+
+/** =========================
+ *  Meraki GRANT
+ *  ========================= */
+async function callMerakiGrant({ baseGrantUrl, continueUrl, durationSeconds = 60 * 60 }) {
+  // Meraki base_grant_url’e GET atarak izin verilir.
+  // Tipik: <base_grant_url>?continue_url=<...>&duration=<sec>
+  const u = new URL(baseGrantUrl);
+  if (continueUrl) u.searchParams.set("continue_url", continueUrl);
+  u.searchParams.set("duration", String(durationSeconds));
+
+  console.log("GRANT_CALLED", { url: u.toString() });
+
+  const res = await fetch(u.toString(), { method: "GET" });
+  const text = await res.text().catch(() => "");
+  return { ok: res.ok, status: res.status, body: text?.slice(0, 2000) };
+}
+
+/** =========================
+ *  Routes
+ *  ========================= */
+
+// Splash entry
+app.get("/", async (req, res) => {
   const q = req.query || {};
-  const baseGrantUrl = safeStr(q.base_grant_url || '');
-  const continueUrl = safeStr(q.user_continue_url || q.continue_url || '');
-  const clientMac = safeStr(q.client_mac || q.clientMac || '');
-  const clientIp = safeStr(q.client_ip || q.clientIp || '');
-  const ssid = safeStr(q.ssid_name || q.ssid || '');
-  const apName = safeStr(q.ap_name || q.apName || '');
+  const baseGrantUrl = pickBaseGrantUrl(q);
+  const continueUrl = pickContinueUrl(q);
+  const clientMac = getClientMac(q);
+  const clientIp = getClientIp(req, q);
 
   const hasBaseGrant = !!baseGrantUrl;
   const hasContinue = !!continueUrl;
   const hasClientMac = !!clientMac;
 
-  return {
-    baseGrantUrl,
-    continueUrl,
-    clientMac,
-    clientIp,
-    ssid,
-    apName,
-    hasBaseGrant,
-    hasContinue,
-    hasClientMac,
-  };
-}
+  console.log("SPLASH_OPEN", { hasBaseGrant, hasContinue, hasClientMac, mode: ENV.OTP_MODE });
 
-function sessionKeyFrom(clientMac) {
-  // keep keys compact
-  const h = crypto.createHash('sha256').update(clientMac).digest('hex').slice(0, 24);
-  return `sess:${h}`;
-}
+  // Persist ctx for later grant
+  if (redis && clientMac) {
+    await saveCtx(clientMac, {
+      baseGrantUrl,
+      continueUrl,
+      clientMac,
+      clientIp,
+      apName: q.ap_name || q.ap || "",
+      ssid: q.ssid || "",
+      seenAt: Date.now()
+    });
+  }
 
-/** ---------------------------
- * UI HTML
- * --------------------------- */
-function renderPage({ title, body }) {
-  return `<!doctype html>
+  await logDb("SPLASH_OPEN", {
+    client_mac: clientMac,
+    client_ip: clientIp,
+    ap_name: q.ap_name || q.ap || "",
+    ssid: q.ssid || "",
+    base_grant_url: baseGrantUrl,
+    continue_url: continueUrl,
+    kvkk_version: ENV.KVKK_VERSION,
+    meta: { q }
+  });
+
+  // Render login UI
+  const logoHtml = ENV.LOGO_URL
+    ? `<div style="text-align:center;margin:16px 0;"><img src="${ENV.LOGO_URL}" alt="logo" style="max-height:64px;max-width:240px"/></div>`
+    : "";
+
+  const kvkkHtml = `
+    <div style="border:1px solid #e5e7eb;border-radius:10px;padding:12px;background:#fafafa;max-height:160px;overflow:auto;">
+      <strong>KVKK Metni (Placeholder)</strong><br/>
+      Bu bir placeholder KVKK metnidir. Gerçek metin daha sonra eklenecek.
+      <br/><br/>Versiyon: ${ENV.KVKK_VERSION}
+    </div>`;
+
+  // Not: SMS şimdilik kapalı, hep screen OTP
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<!doctype html>
 <html lang="tr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${title}</title>
-  <style>
-    :root {
-      --bg: #0b0b12;
-      --card: rgba(255,255,255,0.06);
-      --border: rgba(255,255,255,0.12);
-      --text: rgba(255,255,255,0.92);
-      --muted: rgba(255,255,255,0.66);
-      --accent: #7c3aed;
-      --danger: #ef4444;
-      --ok: #22c55e;
-      --shadow: 0 18px 60px rgba(0,0,0,.45);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      color: var(--text); background: radial-gradient(1200px 900px at 30% 10%, #1a1030 0%, rgba(26,16,48,0) 55%),
-      radial-gradient(900px 600px at 80% 20%, #102a3a 0%, rgba(16,42,58,0) 55%),
-      var(--bg);
-      min-height: 100vh; display: grid; place-items: center; padding: 28px 14px;
-    }
-    .wrap { width: 100%; max-width: 520px; }
-    .brand { display:flex; align-items:center; gap: 12px; margin-bottom: 16px; }
-    .brand img { width: 44px; height: 44px; border-radius: 12px; object-fit: cover; border: 1px solid var(--border); }
-    .brand .t1 { font-size: 18px; font-weight: 700; line-height: 1.1; }
-    .brand .t2 { font-size: 13px; color: var(--muted); margin-top: 4px; }
-    .card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 18px;
-      box-shadow: var(--shadow); padding: 18px;
-      backdrop-filter: blur(8px);
-    }
-    h1 { font-size: 18px; margin: 0 0 6px; }
-    p { margin: 0 0 14px; color: var(--muted); font-size: 13px; line-height: 1.45; }
-    .row { display:flex; gap: 10px; }
-    .row > div { flex: 1; }
-    label { display:block; font-size: 12px; color: var(--muted); margin: 12px 0 6px; }
-    input, button, textarea {
-      width: 100%; border-radius: 12px; border: 1px solid var(--border);
-      background: rgba(0,0,0,0.18); color: var(--text);
-      padding: 12px 12px; outline: none; font-size: 14px;
-    }
-    textarea { min-height: 120px; resize: vertical; }
-    input:focus, textarea:focus { border-color: rgba(124,58,237,.6); box-shadow: 0 0 0 4px rgba(124,58,237,.18); }
-    .btn {
-      margin-top: 14px; background: linear-gradient(135deg, rgba(124,58,237,1), rgba(59,130,246,1));
-      border: none; cursor: pointer; font-weight: 700;
-    }
-    .btn:active { transform: translateY(1px); }
-    .mut { font-size: 12px; color: var(--muted); margin-top: 12px; }
-    .err { color: #fecaca; background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.3); padding: 10px 12px; border-radius: 12px; margin-top: 10px; }
-    .ok { color: #bbf7d0; background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.3); padding: 10px 12px; border-radius: 12px; margin-top: 10px; }
-    .kvkkbox {
-      margin-top: 10px;
-      padding: 12px; border-radius: 12px;
-      border: 1px solid var(--border);
-      background: rgba(0,0,0,0.14);
-      max-height: 180px; overflow: auto;
-      font-size: 12px; color: var(--muted); line-height: 1.5;
-    }
-    .check {
-      display:flex; gap: 10px; align-items:flex-start; margin-top: 12px;
-      padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border);
-      background: rgba(0,0,0,0.14);
-    }
-    .check input { width: 18px; height: 18px; margin-top: 2px; }
-    .check span { font-size: 12px; color: var(--muted); }
-    .otp {
-      margin-top: 12px;
-      padding: 12px; border-radius: 12px;
-      border: 1px dashed rgba(124,58,237,.55);
-      background: rgba(124,58,237,.10);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 22px; letter-spacing: 3px; text-align: center;
-    }
-    .small { font-size: 12px; color: var(--muted); margin-top: 8px; }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Misafir Wi-Fi Giriş</title>
 </head>
-<body>
-  <div class="wrap">
-    ${body}
-    <div class="mut" style="text-align:center;margin-top:14px;opacity:.75">
-      ${safeStr(ENV.BRAND_NAME, 80)} • KVKK ${safeStr(ENV.KVKK_VERSION, 40)}
-    </div>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b1220; margin:0; padding:24px;">
+  <div style="max-width:420px;margin:0 auto;background:#fff;border-radius:18px;padding:22px;box-shadow:0 10px 30px rgba(0,0,0,.25);">
+    ${logoHtml}
+    <h2 style="margin:0 0 6px 0;">Misafir Wi-Fi</h2>
+    <p style="margin:0 0 16px 0;color:#4b5563;">Bağlanmak için bilgilerinizi girin ve doğrulayın.</p>
+
+    <form method="POST" action="/otp/create" style="display:flex;flex-direction:column;gap:10px;">
+      <input type="hidden" name="client_mac" value="${clientMac || ""}"/>
+      <input type="hidden" name="base_grant_url" value="${baseGrantUrl || ""}"/>
+      <input type="hidden" name="continue_url" value="${continueUrl || ""}"/>
+
+      <label style="font-size:13px;color:#374151;">Ad Soyad</label>
+      <input name="full_name" required placeholder="Ad Soyad" style="padding:12px;border:1px solid #d1d5db;border-radius:12px;"/>
+
+      <label style="font-size:13px;color:#374151;">Cep Telefonu</label>
+      <input name="msisdn" required placeholder="05xx..." inputmode="tel" style="padding:12px;border:1px solid #d1d5db;border-radius:12px;"/>
+
+      ${kvkkHtml}
+
+      <label style="display:flex;gap:10px;align-items:flex-start;margin-top:6px;">
+        <input type="checkbox" name="kvkk_accepted" value="1" required style="margin-top:4px;"/>
+        <span style="font-size:13px;color:#374151;">KVKK metnini okudum ve kabul ediyorum.</span>
+      </label>
+
+      <button type="submit" style="margin-top:8px;padding:12px 14px;border:0;border-radius:12px;background:#4f46e5;color:white;font-weight:600;cursor:pointer;">
+        Devam Et (OTP oluştur)
+      </button>
+
+      <div style="margin-top:6px;color:#6b7280;font-size:12px;">
+        Client MAC: <code>${clientMac || "-"}</code>
+      </div>
+    </form>
   </div>
 </body>
-</html>`;
-}
+</html>
+  `);
+});
 
-function kvkkPlaceholderHtml() {
-  return `
-  <strong>KVKK Aydınlatma Metni (Placeholder)</strong><br/>
-  Bu metin şimdilik örnek/placeholder olarak eklenmiştir.<br/><br/>
-  - İşlenen veriler: Ad, Soyad, Telefon, MAC, IP, bağlantı zaman damgaları.<br/>
-  - Amaç: Misafir internet erişiminin sağlanması ve yasal loglama (5651).<br/>
-  - Saklama: Yasal süreler boyunca güvenli biçimde.<br/><br/>
-  Gerçek metin daha sonra şirket hukuk ekibi tarafından sağlanacaktır.
-  `;
-}
+// OTP create
+app.post("/otp/create", async (req, res) => {
+  const body = req.body || {};
+  const clientMac = (body.client_mac || "").toLowerCase();
+  const fullName = (body.full_name || "").trim();
+  const msisdn = (body.msisdn || "").trim();
+  const kvkkAccepted = body.kvkk_accepted === "1" || body.kvkk_accepted === "on";
 
-/** ---------------------------
- * Routes
- * --------------------------- */
+  // ctx fallback (eğer hidden gelmezse redis'ten çek)
+  let ctx = redis && clientMac ? await loadCtx(clientMac) : null;
+
+  const baseGrantUrl = body.base_grant_url || ctx?.baseGrantUrl || "";
+  const continueUrl = body.continue_url || ctx?.continueUrl || "";
+  const clientIp = ctx?.clientIp || "";
+
+  if (!clientMac) return res.status(400).send("client_mac missing");
+  if (!baseGrantUrl) return res.status(400).send("base_grant_url missing");
+  if (!continueUrl) return res.status(400).send("continue_url missing");
+  if (!kvkkAccepted) return res.status(400).send("KVKK onayı gerekli");
+
+  if (redis && (await isLocked(clientMac))) {
+    return res.status(429).send("Çok fazla hatalı deneme. Lütfen sonra tekrar deneyin.");
+  }
+
+  // OTP
+  const otp = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  const marker = String(crypto.randomInt(100000, 999999));
+  const last4 = msisdn.slice(-4);
+
+  // store otp & ctx
+  if (redis) {
+    await saveOtp(clientMac, {
+      otp,
+      marker,
+      last4,
+      createdAt: Date.now(),
+      fullName,
+      msisdn,
+      kvkkAccepted,
+      kvkkVersion: ENV.KVKK_VERSION
+    });
+    await saveCtx(clientMac, {
+      ...(ctx || {}),
+      baseGrantUrl,
+      continueUrl,
+      clientMac,
+      clientIp,
+      fullName,
+      msisdn,
+      kvkkAccepted,
+      kvkkVersion: ENV.KVKK_VERSION
+    });
+  }
+
+  console.log("OTP_CREATED", { marker, last4, client_mac: clientMac });
+  await logDb("OTP_CREATED", {
+    client_mac: clientMac,
+    client_ip: clientIp,
+    full_name: fullName,
+    msisdn,
+    kvkk_accepted: kvkkAccepted,
+    kvkk_version: ENV.KVKK_VERSION,
+    marker,
+    last4,
+    base_grant_url: baseGrantUrl,
+    continue_url: continueUrl
+  });
+
+  // SCREEN mode: ekranda OTP göster, kullanıcı girsin
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>OTP Doğrulama</title>
+</head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b1220; margin:0; padding:24px;">
+  <div style="max-width:420px;margin:0 auto;background:#fff;border-radius:18px;padding:22px;box-shadow:0 10px 30px rgba(0,0,0,.25);">
+    <h2 style="margin:0 0 6px 0;">OTP Doğrulama</h2>
+    <p style="margin:0 0 14px 0;color:#4b5563;">Test modunda OTP ekranda gösterilir.</p>
+
+    <div style="border:1px dashed #9ca3af;border-radius:14px;padding:12px;background:#f9fafb;margin-bottom:12px;">
+      <div style="font-size:13px;color:#6b7280;">OTP (screen mode)</div>
+      <div style="font-size:34px;letter-spacing:4px;font-weight:800;">${otp}</div>
+      <div style="font-size:12px;color:#6b7280;">Marker: ${marker} — Tel son4: ${last4}</div>
+    </div>
+
+    <form method="POST" action="/otp/verify" style="display:flex;flex-direction:column;gap:10px;">
+      <input type="hidden" name="client_mac" value="${clientMac}"/>
+      <input type="hidden" name="marker" value="${marker}"/>
+
+      <label style="font-size:13px;color:#374151;">OTP Kodu</label>
+      <input name="otp" required placeholder="6 haneli" inputmode="numeric" style="padding:12px;border:1px solid #d1d5db;border-radius:12px;"/>
+
+      <button type="submit" style="margin-top:6px;padding:12px 14px;border:0;border-radius:12px;background:#16a34a;color:white;font-weight:700;cursor:pointer;">
+        Doğrula ve Bağlan
+      </button>
+    </form>
+  </div>
+</body>
+</html>
+  `);
+});
+
+// OTP verify -> AUTO GRANT
+app.post("/otp/verify", async (req, res) => {
+  const body = req.body || {};
+  const clientMac = (body.client_mac || "").toLowerCase();
+  const otpIn = (body.otp || "").trim();
+  const markerIn = (body.marker || "").trim();
+
+  if (!clientMac) return res.status(400).send("client_mac missing");
+
+  if (redis && (await isLocked(clientMac))) {
+    return res.status(429).send("Çok fazla hatalı deneme. Lütfen sonra tekrar deneyin.");
+  }
+
+  const otpObj = redis ? await loadOtp(clientMac) : null;
+  const ctx = redis ? await loadCtx(clientMac) : null;
+
+  if (!otpObj || !ctx) {
+    return res.status(400).send("OTP süresi dolmuş veya oturum bilgisi bulunamadı. Lütfen yeniden deneyin.");
+  }
+
+  const ok = otpObj.otp === otpIn && otpObj.marker === markerIn;
+  if (!ok) {
+    const wrong = await incWrong(clientMac);
+    await logDb("OTP_FAIL", {
+      client_mac: clientMac,
+      client_ip: ctx?.clientIp || "",
+      marker: otpObj.marker,
+      last4: otpObj.last4,
+      base_grant_url: ctx?.baseGrantUrl || "",
+      continue_url: ctx?.continueUrl || "",
+      meta: { wrong }
+    });
+    return res.status(401).send("OTP hatalı");
+  }
+
+  await clearWrongAndLock(clientMac);
+
+  console.log("OTP_VERIFY_OK", { marker: otpObj.marker, client_mac: clientMac });
+  await logDb("OTP_VERIFIED", {
+    client_mac: clientMac,
+    client_ip: ctx?.clientIp || "",
+    full_name: ctx?.fullName || otpObj.fullName,
+    msisdn: ctx?.msisdn || otpObj.msisdn,
+    kvkk_accepted: true,
+    kvkk_version: ctx?.kvkkVersion || ENV.KVKK_VERSION,
+    marker: otpObj.marker,
+    last4: otpObj.last4,
+    base_grant_url: ctx?.baseGrantUrl || "",
+    continue_url: ctx?.continueUrl || ""
+  });
+
+  // AUTO GRANT
+  const baseGrantUrl = ctx?.baseGrantUrl || "";
+  const continueUrl = ctx?.continueUrl || "";
+
+  if (!baseGrantUrl || !continueUrl) {
+    return res.status(500).send("Grant context missing (base_grant_url / continue_url)");
+  }
+
+  await logDb("GRANT_CALLED", {
+    client_mac: clientMac,
+    client_ip: ctx?.clientIp || "",
+    base_grant_url: baseGrantUrl,
+    continue_url: continueUrl,
+    marker: otpObj.marker,
+    last4: otpObj.last4
+  });
+
+  const grant = await callMerakiGrant({
+    baseGrantUrl,
+    continueUrl,
+    durationSeconds: 60 * 60 // 1 saat örnek
+  });
+
+  if (!grant.ok) {
+    console.log("GRANT_FAIL", { status: grant.status });
+    await logDb("GRANT_FAIL", {
+      client_mac: clientMac,
+      client_ip: ctx?.clientIp || "",
+      base_grant_url: baseGrantUrl,
+      continue_url: continueUrl,
+      marker: otpObj.marker,
+      last4: otpObj.last4,
+      meta: { status: grant.status, body: grant.body?.slice(0, 500) }
+    });
+    return res.status(502).send("Meraki grant başarısız. Logları kontrol et.");
+  }
+
+  console.log("GRANT_OK", { client_mac: clientMac });
+  await logDb("GRANT_OK", {
+    client_mac: clientMac,
+    client_ip: ctx?.clientIp || "",
+    base_grant_url: baseGrantUrl,
+    continue_url: continueUrl,
+    marker: otpObj.marker,
+    last4: otpObj.last4
+  });
+
+  // OTP tek kullanımlık olsun
+  await clearOtp(clientMac);
+
+  // Meraki continue_url’ye yönlendir
+  res.redirect(continueUrl);
+});
 
 // Health
-app.get('/health', (req, res) => res.status(200).json({ ok: true }));
-
-// Main Splash
-app.get('/', async (req, res) => {
-  const m = parseMerakiParams(req);
-  console.log('SPLASH_OPEN', { hasBaseGrant: m.hasBaseGrant, hasContinue: m.hasContinue, hasClientMac: m.hasClientMac, mode: ENV.OTP_MODE });
-
-  // if not coming from Meraki and not allowed in dev
-  if ((!m.hasBaseGrant || !m.hasClientMac) && !ENV.DEV_ALLOW_NO_MERAKI) {
-    return res.status(400).send(
-      renderPage({
-        title: 'Invalid Request',
-        body: `
-          <div class="card">
-            <h1>Geçersiz istek</h1>
-            <p>Bu sayfa Meraki Captive Portal üzerinden açılmalıdır.</p>
-            <div class="err">base_grant_url / client_mac eksik görünüyor.</div>
-          </div>
-        `,
-      })
-    );
-  }
-
-  // Store meraki params tied to MAC
-  if (m.clientMac) {
-    const sk = sessionKeyFrom(m.clientMac);
-    await kvSet(
-      sk,
-      {
-        meraki: {
-          baseGrantUrl: m.baseGrantUrl,
-          continueUrl: m.continueUrl,
-          clientMac: m.clientMac,
-          clientIp: m.clientIp,
-          ssid: m.ssid,
-          apName: m.apName,
-        },
-        state: 'OPEN',
-        createdAt: Date.now(),
-      },
-      ENV.OTP_TTL_SECONDS
-    );
-  }
-
-  const logo = ENV.COMPANY_LOGO_URL
-    ? `<img src="${safeStr(ENV.COMPANY_LOGO_URL, 400)}" alt="logo" />`
-    : `<img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Crect rx='24' width='120' height='120' fill='%237c3aed'/%3E%3Ctext x='50%25' y='56%25' font-size='56' text-anchor='middle' fill='white' font-family='Arial'%3EWi%3C/text%3E%3C/svg%3E" alt="logo"/>`;
-
-  const body = `
-    <div class="brand">
-      ${logo}
-      <div>
-        <div class="t1">${safeStr(ENV.BRAND_NAME, 80)}</div>
-        <div class="t2">Misafir internet erişimi</div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h1>Giriş</h1>
-      <p>Lütfen bilgilerinizi girin ve KVKK metnini onaylayın. Ardından doğrulama kodu ile internete bağlanacaksınız.</p>
-
-      <form method="POST" action="/start">
-        <input type="hidden" name="client_mac" value="${safeStr(m.clientMac)}" />
-
-        <div class="row">
-          <div>
-            <label>Ad</label>
-            <input name="first_name" autocomplete="given-name" required maxlength="50" />
-          </div>
-          <div>
-            <label>Soyad</label>
-            <input name="last_name" autocomplete="family-name" required maxlength="50" />
-          </div>
-        </div>
-
-        <label>Cep telefonu</label>
-        <input name="phone" inputmode="tel" placeholder="05xx xxx xx xx" required maxlength="25" />
-
-        <label>KVKK Aydınlatma Metni</label>
-        <div class="kvkkbox">${kvkkPlaceholderHtml()}</div>
-
-        <div class="check">
-          <input type="checkbox" name="kvkk_accepted" value="1" required />
-          <span>KVKK aydınlatma metnini okudum ve onaylıyorum.</span>
-        </div>
-
-        <button class="btn" type="submit">Devam et</button>
-      </form>
-
-      <div class="mut">
-        Bilgiler güvenli şekilde saklanır. (5651 log kaydı tutulur.)
-      </div>
-    </div>
-  `;
-
-  res.status(200).send(renderPage({ title: 'Guest Wi-Fi', body }));
-});
-
-// Start: create OTP
-app.post('/start', async (req, res) => {
-  const first_name = safeStr(req.body.first_name, 50).trim();
-  const last_name = safeStr(req.body.last_name, 50).trim();
-  const phone = safeStr(req.body.phone, 25).trim();
-  const kvkk_accepted = req.body.kvkk_accepted === '1';
-
-  // Meraki MAC is required
-  const client_mac = safeStr(req.body.client_mac, 64).trim();
-
-  if (!first_name || !last_name || !phone || !kvkk_accepted) {
-    return res.status(400).send(
-      renderPage({
-        title: 'Hata',
-        body: `
-          <div class="card">
-            <h1>Eksik bilgi</h1>
-            <p>Lütfen tüm alanları doldurun ve KVKK onayını işaretleyin.</p>
-            <a href="/" style="color: var(--accent); text-decoration:none;">Geri dön</a>
-          </div>
-        `,
-      })
-    );
-  }
-
-  if (!client_mac && !ENV.DEV_ALLOW_NO_MERAKI) {
-    return res.status(400).send(
-      renderPage({
-        title: 'Hata',
-        body: `<div class="card"><h1>Hata</h1><div class="err">client_mac bulunamadı.</div></div>`,
-      })
-    );
-  }
-
-  const otp = randOtp();
-  const marker = String(Math.floor(100000 + Math.random() * 900000)); // tracking id
-
-  // load existing session (meraki params)
-  const sk = sessionKeyFrom(client_mac || ('dev-' + crypto.randomUUID()));
-  const sess = (await kvGet(sk)) || {};
-  const meraki = sess.meraki || {};
-
-  const newSess = {
-    meraki,
-    user: { first_name, last_name, phone, kvkk_accepted: true, kvkk_version: ENV.KVKK_VERSION },
-    otp: {
-      marker,
-      value: otp,
-      wrong: 0,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + ENV.OTP_TTL_SECONDS * 1000,
-      verified: false,
-    },
-    state: 'OTP_CREATED',
-    createdAt: sess.createdAt || Date.now(),
-  };
-
-  await kvSet(sk, newSess, ENV.OTP_TTL_SECONDS);
-
-  console.log('OTP_CREATED', { marker, last4: maskPhone(phone).replace('****', ''), client_mac });
-
-  // SMS disabled -> show OTP on screen
-  const logo = ENV.COMPANY_LOGO_URL
-    ? `<img src="${safeStr(ENV.COMPANY_LOGO_URL, 400)}" alt="logo" />`
-    : '';
-
-  const body = `
-    <div class="brand">
-      ${logo || ''}
-      <div>
-        <div class="t1">${safeStr(ENV.BRAND_NAME, 80)}</div>
-        <div class="t2">Doğrulama</div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h1>Doğrulama Kodu</h1>
-      <p>SMS devre dışı. Kod ekranda gösteriliyor.</p>
-
-      <div class="otp">${otp}</div>
-      <div class="small">Bu kod ${ENV.OTP_TTL_SECONDS} saniye geçerlidir.</div>
-
-      <form method="POST" action="/verify">
-        <input type="hidden" name="client_mac" value="${safeStr(client_mac)}" />
-        <label>Kodu girin</label>
-        <input name="otp" inputmode="numeric" autocomplete="one-time-code" required maxlength="10" />
-        <button class="btn" type="submit">Doğrula</button>
-      </form>
-    </div>
-  `;
-
-  res.status(200).send(renderPage({ title: 'OTP', body }));
-});
-
-// Verify OTP
-app.post('/verify', async (req, res) => {
-  const client_mac = safeStr(req.body.client_mac, 64).trim();
-  const otp_in = safeStr(req.body.otp, 10).trim();
-
-  if (!client_mac && !ENV.DEV_ALLOW_NO_MERAKI) {
-    return res.status(400).send(renderPage({ title: 'Hata', body: `<div class="card"><div class="err">client_mac yok</div></div>` }));
-  }
-
-  const sk = sessionKeyFrom(client_mac || ('dev-' + crypto.randomUUID()));
-  const sess = await kvGet(sk);
-  if (!sess || !sess.otp) {
-    return res.status(400).send(
-      renderPage({
-        title: 'Süre doldu',
-        body: `<div class="card"><h1>Süre doldu</h1><p>Oturum bulunamadı. Lütfen tekrar başlayın.</p><a href="/" style="color:var(--accent);text-decoration:none;">Başa dön</a></div>`,
-      })
-    );
-  }
-
-  // expired
-  if (Date.now() > sess.otp.expiresAt) {
-    await kvDel(sk);
-    return res.status(400).send(
-      renderPage({
-        title: 'Süre doldu',
-        body: `<div class="card"><h1>Kod süresi doldu</h1><p>Lütfen tekrar deneyin.</p><a href="/" style="color:var(--accent);text-decoration:none;">Başa dön</a></div>`,
-      })
-    );
-  }
-
-  if (otp_in !== sess.otp.value) {
-    sess.otp.wrong = (sess.otp.wrong || 0) + 1;
-    await kvSet(sk, sess, Math.ceil((sess.otp.expiresAt - Date.now()) / 1000));
-
-    if (sess.otp.wrong >= ENV.MAX_WRONG_ATTEMPTS) {
-      await kvDel(sk);
-      return res.status(400).send(
-        renderPage({
-          title: 'Kilit',
-          body: `<div class="card"><h1>Çok fazla deneme</h1><p>Lütfen daha sonra tekrar deneyin.</p></div>`,
-        })
-      );
-    }
-
-    return res.status(400).send(
-      renderPage({
-        title: 'Hatalı kod',
-        body: `
-          <div class="card">
-            <h1>Hatalı kod</h1>
-            <p>Lütfen tekrar deneyin. (${sess.otp.wrong}/${ENV.MAX_WRONG_ATTEMPTS})</p>
-            <form method="POST" action="/verify">
-              <input type="hidden" name="client_mac" value="${safeStr(client_mac)}" />
-              <label>Kodu girin</label>
-              <input name="otp" inputmode="numeric" required maxlength="10" />
-              <button class="btn" type="submit">Doğrula</button>
-            </form>
-          </div>
-        `,
-      })
-    );
-  }
-
-  // OK
-  sess.otp.verified = true;
-  sess.state = 'OTP_VERIFIED';
-  await kvSet(sk, sess, Math.ceil((sess.otp.expiresAt - Date.now()) / 1000));
-
-  console.log('OTP_VERIFY_OK', { marker: sess.otp.marker, client_mac });
-
-  // Next step: grant access
-  const body = `
-    <div class="card">
-      <h1>Doğrulandı</h1>
-      <p>Bağlantı izni veriliyor…</p>
-      <form method="POST" action="/grant">
-        <input type="hidden" name="client_mac" value="${safeStr(client_mac)}" />
-        <button class="btn" type="submit">Bağlan</button>
-      </form>
-      <div class="mut">Butona basınca internet erişiminiz aktif olur.</div>
-    </div>
-  `;
-  res.status(200).send(renderPage({ title: 'Verified', body }));
-});
-
-// Grant access via Meraki base_grant_url
-app.post('/grant', async (req, res) => {
-  const client_mac = safeStr(req.body.client_mac, 64).trim();
-  const sk = sessionKeyFrom(client_mac || ('dev-' + crypto.randomUUID()));
-  const sess = await kvGet(sk);
-
-  if (!sess || !sess.otp?.verified) {
-    return res.status(400).send(
-      renderPage({
-        title: 'Hata',
-        body: `<div class="card"><h1>Hata</h1><div class="err">Önce doğrulama yapılmalı.</div></div>`,
-      })
-    );
-  }
-
-  const meraki = sess.meraki || {};
-  const user = sess.user || {};
-
-  // Log attempt
-  await logAccess('OTP_VERIFIED', {
-    first_name: user.first_name,
-    last_name: user.last_name,
-    phone: user.phone,
-    kvkk_accepted: true,
-    kvkk_version: user.kvkk_version,
-    marker: sess.otp.marker,
-    client_mac: meraki.clientMac || client_mac,
-    client_ip: meraki.clientIp || getClientIp(req),
-    ssid: meraki.ssid,
-    ap_name: meraki.apName,
-    base_grant_url: meraki.baseGrantUrl,
-    user_continue_url: meraki.continueUrl,
-    user_agent: safeStr(req.headers['user-agent'], 300),
-    extra: { mode: ENV.OTP_MODE },
+app.get("/health", async (req, res) => {
+  res.json({
+    ok: true,
+    redis: !!redis,
+    db: !!db,
+    mode: ENV.OTP_MODE,
+    kvkk: ENV.KVKK_VERSION
   });
-
-  // If no Meraki params (dev)
-  if ((!meraki.baseGrantUrl || !meraki.clientMac) && ENV.DEV_ALLOW_NO_MERAKI) {
-    await kvDel(sk);
-    return res.status(200).send(
-      renderPage({
-        title: 'Dev OK',
-        body: `<div class="card"><h1>Dev mod</h1><div class="ok">Meraki olmadan tamamlandı.</div></div>`,
-      })
-    );
-  }
-
-  if (!meraki.baseGrantUrl) {
-    return res.status(400).send(
-      renderPage({
-        title: 'Hata',
-        body: `<div class="card"><h1>Hata</h1><div class="err">base_grant_url eksik.</div></div>`,
-      })
-    );
-  }
-
-  // Meraki grant: call base_grant_url with continue_url
-  // Usually: base_grant_url?continue_url=<...>
-  // Some deployments also require "duration", "redirect_url" etc.
-  let grantUrl = meraki.baseGrantUrl;
-
-  try {
-    const u = new URL(grantUrl);
-    if (meraki.continueUrl) u.searchParams.set('continue_url', meraki.continueUrl);
-    // you can optionally set session duration:
-    // u.searchParams.set('duration', '3600'); // seconds
-    grantUrl = u.toString();
-  } catch (_) {
-    // if base_grant_url is not a full URL, just append
-    if (meraki.continueUrl) {
-      const glue = grantUrl.includes('?') ? '&' : '?';
-      grantUrl = `${grantUrl}${glue}continue_url=${encodeURIComponent(meraki.continueUrl)}`;
-    }
-  }
-
-  try {
-    const r = await fetch(grantUrl, { method: 'GET' });
-    const txt = await r.text();
-
-    // Log success-ish
-    await logAccess('GRANT_CALLED', {
-      first_name: user.first_name,
-      last_name: user.last_name,
-      phone: user.phone,
-      kvkk_accepted: true,
-      kvkk_version: user.kvkk_version,
-      marker: sess.otp.marker,
-      client_mac: meraki.clientMac || client_mac,
-      client_ip: meraki.clientIp || getClientIp(req),
-      ssid: meraki.ssid,
-      ap_name: meraki.apName,
-      base_grant_url: meraki.baseGrantUrl,
-      user_continue_url: meraki.continueUrl,
-      user_agent: safeStr(req.headers['user-agent'], 300),
-      extra: { http_status: r.status },
-    });
-
-    // cleanup session
-    await kvDel(sk);
-
-    // If Meraki returns a redirect HTML or JSON; best is to send user to continue_url
-    if (meraki.continueUrl) {
-      return res.redirect(302, meraki.continueUrl);
-    }
-
-    // fallback display
-    return res.status(200).send(
-      renderPage({
-        title: 'Bağlandı',
-        body: `
-          <div class="card">
-            <h1>Bağlantı sağlandı</h1>
-            <div class="ok">Erişim izni verildi.</div>
-            <div class="mut">Meraki yanıtı (kısaltılmış):</div>
-            <pre style="white-space:pre-wrap;word-break:break-word;color:var(--muted);font-size:12px;margin-top:10px">${safeStr(txt, 1200)}</pre>
-          </div>
-        `,
-      })
-    );
-  } catch (e) {
-    console.error('GRANT ERROR:', e?.message || e);
-
-    await logAccess('GRANT_ERROR', {
-      first_name: user.first_name,
-      last_name: user.last_name,
-      phone: user.phone,
-      kvkk_accepted: true,
-      kvkk_version: user.kvkk_version,
-      marker: sess.otp.marker,
-      client_mac: meraki.clientMac || client_mac,
-      client_ip: meraki.clientIp || getClientIp(req),
-      ssid: meraki.ssid,
-      ap_name: meraki.apName,
-      base_grant_url: meraki.baseGrantUrl,
-      user_continue_url: meraki.continueUrl,
-      user_agent: safeStr(req.headers['user-agent'], 300),
-      extra: { error: safeStr(e?.message || e, 300) },
-    });
-
-    return res.status(500).send(
-      renderPage({
-        title: 'Hata',
-        body: `<div class="card"><h1>Bağlantı hatası</h1><div class="err">${safeStr(e?.message || e, 300)}</div></div>`,
-      })
-    );
-  }
 });
 
-/** ---------------------------
- * Start / Shutdown
- * --------------------------- */
-let server = null;
-
-async function start() {
+/** =========================
+ *  Boot
+ *  ========================= */
+(async () => {
   await initRedis();
-  await initDatabase();
+  await initDb();
 
-  server = app.listen(ENV.PORT, () => {
+  app.listen(ENV.PORT, () => {
     console.log(`Server running on port ${ENV.PORT}`);
   });
-}
-
-start().catch((e) => {
-  console.error('BOOT ERROR:', e?.message || e);
-  process.exit(1);
-});
-
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received. Shutting down...');
-  try {
-    if (server) await new Promise((r) => server.close(r));
-    if (redisReady && redis) await redis.quit();
-    if (pool) await pool.end();
-  } catch (_) {}
-  process.exit(0);
-});
+})();
