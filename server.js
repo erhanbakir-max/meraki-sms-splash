@@ -1,26 +1,59 @@
 import express from "express";
 import { createClient } from "redis";
-import { normalizeTrMsisdn, sendSmsViaIletimerkezi } from "./smsService.js";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Railway PORT
 const PORT = Number(process.env.PORT || 8080);
 
-// OTP ayarları
-const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 180); // 3 dk
-const OTP_RATE_LIMIT_SECONDS = Number(process.env.OTP_RATE_LIMIT_SECONDS || 60); // 60 sn
-const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen | sms
+// Mod: şimdilik screen
+const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen | sms (sms'i sonra açacağız)
+
+// Süreler
+const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 180);            // OTP geçerlilik
+const RL_MAC_SECONDS = Number(process.env.OTP_RL_MAC_SECONDS || 30);           // aynı MAC için
+const RL_MSISDN_SECONDS = Number(process.env.OTP_RL_MSISDN_SECONDS || 60);     // aynı numara için
+const MAX_WRONG_ATTEMPTS = Number(process.env.OTP_MAX_WRONG || 5);             // yanlış deneme limiti
+const LOCK_SECONDS = Number(process.env.OTP_LOCK_SECONDS || 600);              // kilit süresi (10 dk)
 
 // Redis
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL;
 let redis = null;
 
+// ---------- Utils ----------
+const s = (v) => (v === undefined || v === null ? "" : String(v));
+const onlyDigits = (v) => s(v).replace(/\D/g, "");
+
+function maskLast4(digits) {
+  return digits.length >= 4 ? digits.slice(-4) : null;
+}
+
+// TR normalize: 0XXXXXXXXXX / 90XXXXXXXXXX / +90... -> 5XXXXXXXXX
+function normalizeTrMsisdn(inputRaw) {
+  const raw = onlyDigits(inputRaw);
+
+  let x = raw;
+  if (x.startsWith("90") && x.length === 12) x = x.slice(2);
+  if (x.startsWith("0") && x.length === 11) x = x.slice(1);
+
+  const ok = /^5\d{9}$/.test(x);
+  return { ok, msisdn: ok ? x : "", raw: inputRaw, reason: ok ? null : "Expected 5XXXXXXXXX (10 digits)" };
+}
+
+function genOtp6() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+}
+
+function genMarker() {
+  return String(crypto.randomInt(100000, 999999));
+}
+
+// ---------- Redis init ----------
 async function initRedis() {
   if (!REDIS_URL) {
-    console.log("REDIS: not configured (REDIS_URL / REDIS_PUBLIC_URL missing). Running WITHOUT persistent store.");
+    console.log("REDIS: not configured (REDIS_URL / REDIS_PUBLIC_URL missing).");
     return null;
   }
   const client = createClient({ url: REDIS_URL });
@@ -30,14 +63,60 @@ async function initRedis() {
   return client;
 }
 
-// Sağlık kontrolü
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+// ---------- Redis helpers ----------
+async function setJsonEx(key, ttlSec, obj) {
+  await redis.setEx(key, ttlSec, JSON.stringify(obj));
+}
+async function getJson(key) {
+  const v = await redis.get(key);
+  return v ? JSON.parse(v) : null;
+}
 
-// Splash entry
-app.get("/", async (req, res) => {
-  const base_grant_url = req.query.base_grant_url || "";
-  const user_continue_url = req.query.user_continue_url || req.query.continue_url || "";
-  const client_mac = req.query.client_mac || "";
+async function rateLimitOrThrow(key, ttlSec, humanMsg) {
+  // SET key NX EX ttlSec
+  const ok = await redis.set(key, "1", { NX: true, EX: ttlSec });
+  if (!ok) {
+    const ttl = await redis.ttl(key);
+    const wait = ttl > 0 ? ttl : ttlSec;
+    const msg = `${humanMsg} (${wait} sn bekleyin)`;
+    const err = new Error(msg);
+    err.status = 429;
+    throw err;
+  }
+}
+
+// Wrong attempts + lock
+async function ensureNotLocked(lockKey) {
+  const locked = await redis.get(lockKey);
+  if (locked) {
+    const ttl = await redis.ttl(lockKey);
+    const msg = `Çok fazla hatalı deneme. ${ttl > 0 ? ttl : LOCK_SECONDS} sn sonra tekrar deneyin.`;
+    const err = new Error(msg);
+    err.status = 429;
+    throw err;
+  }
+}
+
+async function incWrongAndMaybeLock(wrongKey, lockKey) {
+  const n = await redis.incr(wrongKey);
+  if (n === 1) {
+    // ilk artışta wrongKey TTL ver
+    await redis.expire(wrongKey, LOCK_SECONDS);
+  }
+  if (n >= MAX_WRONG_ATTEMPTS) {
+    await redis.setEx(lockKey, LOCK_SECONDS, "1");
+  }
+  return n;
+}
+
+// ---------- Routes ----------
+app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, mode: OTP_MODE }));
+
+// Meraki custom splash URL -> GET /
+app.get("/", (req, res) => {
+  const base_grant_url = s(req.query.base_grant_url);
+  const user_continue_url = s(req.query.user_continue_url || req.query.continue_url);
+  const client_mac = s(req.query.client_mac);
 
   console.log("SPLASH_OPEN", {
     hasBaseGrant: Boolean(base_grant_url),
@@ -46,7 +125,6 @@ app.get("/", async (req, res) => {
     mode: OTP_MODE
   });
 
-  // Meraki paramları yoksa sadece running göster
   if (!base_grant_url || !user_continue_url) {
     return res.status(200).send("meraki-sms-splash is running");
   }
@@ -54,243 +132,265 @@ app.get("/", async (req, res) => {
   return res.status(200).send(renderPhoneForm({ base_grant_url, user_continue_url, client_mac }));
 });
 
-// OTP request
+// OTP Request
 app.post("/otp/request", async (req, res) => {
-  const base_grant_url = req.body.base_grant_url || "";
-  const user_continue_url = req.body.user_continue_url || "";
-  const client_mac = req.body.client_mac || "";
-  const phoneRaw = req.body.phone || "";
+  try {
+    const base_grant_url = s(req.body.base_grant_url);
+    const user_continue_url = s(req.body.user_continue_url);
+    const client_mac = s(req.body.client_mac);
+    const phoneRaw = s(req.body.phone);
 
-  const norm = normalizeTrMsisdn(phoneRaw);
-
-  if (!base_grant_url || !user_continue_url) {
-    return res.status(400).send("Missing base_grant_url or user_continue_url");
-  }
-  if (!norm.ok) {
-    return res.status(400).send(renderError(`MSISDN format invalid. ${norm.reason}. Got: ${phoneRaw}`, { base_grant_url, user_continue_url, client_mac }));
-  }
-
-  const msisdn = norm.msisdn;
-  const last4 = norm.last4;
-
-  // Rate limit: aynı numaraya 60 sn içinde tekrar OTP verme
-  if (redis) {
-    const rlKey = `otp:rl:${msisdn}`;
-    const exists = await redis.exists(rlKey);
-    if (exists) {
-      return res.status(429).send(renderError(`Lütfen ${OTP_RATE_LIMIT_SECONDS} sn bekleyip tekrar deneyin.`, { base_grant_url, user_continue_url, client_mac }));
+    if (!base_grant_url || !user_continue_url || !client_mac) {
+      return res.status(400).send(renderError("Eksik parametre (base_grant_url / user_continue_url / client_mac)", {}));
     }
-    await redis.setEx(rlKey, OTP_RATE_LIMIT_SECONDS, "1");
-  }
 
-  const code = genOtp6();
-  const marker = String(Math.floor(100000 + Math.random() * 900000)); // log için
-
-  const payload = {
-    code,
-    msisdn,
-    last4,
-    client_mac,
-    base_grant_url,
-    user_continue_url,
-    created_at: Date.now()
-  };
-
-  console.log("OTP_CREATED", { marker, last4, client_mac });
-
-  // Redis’e yaz
-  if (redis) {
-    await redis.setEx(`otp:${marker}`, OTP_TTL_SECONDS, JSON.stringify(payload));
-  } else {
-    // Redis yoksa in-memory fallback (restart’ta gider)
-    globalThis.__OTP_MEM__ = globalThis.__OTP_MEM__ || new Map();
-    globalThis.__OTP_MEM__.set(`otp:${marker}`, { payload, exp: Date.now() + OTP_TTL_SECONDS * 1000 });
-  }
-
-  // SMS mode ise gönder
-  if (OTP_MODE === "sms") {
-    const msg = `Doğrulama kodunuz: ${code}`;
-    const debug = String(process.env.SMS_DEBUG || "false").toLowerCase() === "true";
-
-    const smsResp = await sendSmsViaIletimerkezi({ msisdn, text: msg, debug });
-
-    if (!smsResp.ok) {
-      console.log("OTP_SMS_FAILED", {
-        marker,
-        error: smsResp.code || "ILETIMERKEZI_ERROR",
-        http: smsResp.http,
-        message: smsResp.message
-      });
-      // SMS başarısızsa ekrana düşelim (testte işimizi görür)
-      return res.status(200).send(renderOtpPage({ marker, last4, base_grant_url, user_continue_url, client_mac, code, screenFallback: true }));
+    const norm = normalizeTrMsisdn(phoneRaw);
+    if (!norm.ok) {
+      return res.status(400).send(renderError(`MSISDN format invalid. ${norm.reason}. Got: ${phoneRaw}`, {
+        base_grant_url, user_continue_url, client_mac
+      }));
     }
-  }
 
-  // screen mode: kodu ekranda göster
-  return res.status(200).send(renderOtpPage({ marker, last4, base_grant_url, user_continue_url, client_mac, code, screenFallback: OTP_MODE !== "sms" }));
-});
+    const msisdn = norm.msisdn;
+    const last4 = maskLast4(msisdn);
 
-// OTP verify
-app.post("/otp/verify", async (req, res) => {
-  const marker = String(req.body.marker || "").trim();
-  const code = String(req.body.code || "").trim();
+    // Lock kontrol (msisdn + mac)
+    await ensureNotLocked(`otp:lock:msisdn:${msisdn}`);
+    await ensureNotLocked(`otp:lock:mac:${client_mac}`);
 
-  if (!marker || !code) return res.status(400).send("Missing marker or code");
+    // Rate limits
+    await rateLimitOrThrow(`otp:rl:mac:${client_mac}`, RL_MAC_SECONDS, "Cihaz için çok hızlı deneme");
+    await rateLimitOrThrow(`otp:rl:msisdn:${msisdn}`, RL_MSISDN_SECONDS, "Numara için çok hızlı deneme");
 
-  const key = `otp:${marker}`;
-  const data = await loadOtp(key);
-  if (!data) {
-    return res.status(400).send(renderError("Kod süresi doldu veya bulunamadı. Tekrar isteyin.", {}));
-  }
+    // Tek aktif OTP: (msisdn+mac) => marker
+    const marker = genMarker();
+    const code = genOtp6();
 
-  const expected = String(data.code);
-  if (code !== expected) {
-    return res.status(401).send(renderError("Kod hatalı.", {
-      base_grant_url: data.base_grant_url,
-      user_continue_url: data.user_continue_url,
-      client_mac: data.client_mac
+    // marker payload
+    const payload = {
+      marker,
+      code,
+      msisdn,
+      last4,
+      client_mac,
+      base_grant_url,
+      user_continue_url,
+      created_at: Date.now()
+    };
+
+    // Store:
+    // 1) otp:marker:<marker> -> payload (TTL)
+    // 2) otp:active:<mac>:<msisdn> -> marker (TTL)
+    await setJsonEx(`otp:marker:${marker}`, OTP_TTL_SECONDS, payload);
+    await redis.setEx(`otp:active:${client_mac}:${msisdn}`, OTP_TTL_SECONDS, marker);
+
+    console.log("OTP_CREATED", { marker, last4, client_mac });
+
+    // Screen mode: kodu ekranda göster
+    return res.status(200).send(renderOtpPage({
+      marker,
+      last4,
+      base_grant_url,
+      user_continue_url,
+      client_mac,
+      code
     }));
+  } catch (e) {
+    const status = e?.status || 500;
+    return res.status(status).send(renderError(e?.message || "OTP request failed", {}));
   }
-
-  console.log("OTP_VERIFY_OK", { marker, client_mac: data.client_mac });
-
-  // Tek kullanımlık: sil
-  await deleteOtp(key);
-
-  // Meraki’ye grant için redirect
-  // base_grant_url çoğu zaman gerekli query’leri içerir; direkt oraya gönderiyoruz.
-  return res.redirect(data.base_grant_url);
 });
 
-// ---- helpers: OTP store ----
+// OTP Verify
+app.post("/otp/verify", async (req, res) => {
+  try {
+    const marker = s(req.body.marker).trim();
+    const code = s(req.body.code).trim();
 
-async function loadOtp(key) {
-  if (redis) {
-    const raw = await redis.get(key);
-    return raw ? JSON.parse(raw) : null;
+    if (!marker || !code) {
+      return res.status(400).send(renderError("Eksik marker veya code", {}));
+    }
+
+    const data = await getJson(`otp:marker:${marker}`);
+    if (!data) {
+      return res.status(400).send(renderError("Kod süresi doldu veya bulunamadı. Tekrar kod isteyin.", {}));
+    }
+
+    const msisdn = data.msisdn;
+    const client_mac = data.client_mac;
+
+    // Lock kontrol
+    await ensureNotLocked(`otp:lock:msisdn:${msisdn}`);
+    await ensureNotLocked(`otp:lock:mac:${client_mac}`);
+
+    // Active marker check (eski marker ile verify edilmesin)
+    const activeMarker = await redis.get(`otp:active:${client_mac}:${msisdn}`);
+    if (!activeMarker || activeMarker !== marker) {
+      return res.status(400).send(renderError("Bu kod artık geçerli değil. Lütfen yeniden kod isteyin.", {
+        base_grant_url: data.base_grant_url,
+        user_continue_url: data.user_continue_url,
+        client_mac
+      }));
+    }
+
+    if (code !== s(data.code)) {
+      const wrongMsisdnKey = `otp:wrong:msisdn:${msisdn}`;
+      const lockMsisdnKey = `otp:lock:msisdn:${msisdn}`;
+      const wrongMacKey = `otp:wrong:mac:${client_mac}`;
+      const lockMacKey = `otp:lock:mac:${client_mac}`;
+
+      const n1 = await incWrongAndMaybeLock(wrongMsisdnKey, lockMsisdnKey);
+      const n2 = await incWrongAndMaybeLock(wrongMacKey, lockMacKey);
+
+      console.log("OTP_VERIFY_FAIL", { marker, client_mac, wrong_msisdn: n1, wrong_mac: n2 });
+
+      return res.status(401).send(renderError("Kod hatalı.", {
+        base_grant_url: data.base_grant_url,
+        user_continue_url: data.user_continue_url,
+        client_mac
+      }));
+    }
+
+    // OK
+    console.log("OTP_VERIFY_OK", { marker, client_mac });
+
+    // tek kullanımlık: sil
+    await redis.del(`otp:marker:${marker}`);
+    await redis.del(`otp:active:${client_mac}:${msisdn}`);
+    await redis.del(`otp:wrong:msisdn:${msisdn}`);
+    await redis.del(`otp:wrong:mac:${client_mac}`);
+
+    // Meraki grant URL’e git
+    // base_grant_url genelde hazır gelir; continue_url meraki tarafında zaten taşınır.
+    return res.redirect(data.base_grant_url);
+  } catch (e) {
+    const status = e?.status || 500;
+    return res.status(status).send(renderError(e?.message || "OTP verify failed", {}));
   }
-  const m = globalThis.__OTP_MEM__;
-  if (!m) return null;
-  const entry = m.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.exp) {
-    m.delete(key);
-    return null;
-  }
-  return entry.payload;
-}
+});
 
-async function deleteOtp(key) {
-  if (redis) return redis.del(key);
-  const m = globalThis.__OTP_MEM__;
-  if (m) m.delete(key);
-  return 0;
-}
-
-function genOtp6() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-// ---- HTML ----
-
+// ---------- HTML ----------
 function renderPhoneForm({ base_grant_url, user_continue_url, client_mac }) {
   return `<!doctype html>
 <html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WiFi Doğrulama</title>
-<style>
-body{font-family:system-ui,Arial;margin:24px;max-width:520px}
-input,button{font-size:16px;padding:10px;width:100%;margin:8px 0}
-.small{color:#666;font-size:13px}
-</style>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WiFi Doğrulama</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:24px;max-width:520px}
+    input,button{font-size:16px;padding:10px;width:100%;margin:8px 0}
+    .small{color:#666;font-size:13px}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  </style>
 </head>
 <body>
-<h2>Telefon Doğrulama</h2>
-<p class="small">Numarayı <b>5XXXXXXXXX</b> (10 hane) gir. (0 yok, +90 yok)</p>
+  <h2>Telefon Doğrulama</h2>
+  <p class="small">Numarayı <b>5XXXXXXXXX</b> (10 hane) gir. (0 yok, +90 yok)</p>
+  <p class="small">Cihaz: <span class="mono">${escapeHtml(client_mac)}</span></p>
 
-<form method="post" action="/otp/request">
-  <input name="phone" placeholder="5333312520" autocomplete="tel" required />
-  <input type="hidden" name="base_grant_url" value="${escapeAttr(base_grant_url)}" />
-  <input type="hidden" name="user_continue_url" value="${escapeAttr(user_continue_url)}" />
-  <input type="hidden" name="client_mac" value="${escapeAttr(client_mac)}" />
-  <button type="submit">Kod Al</button>
-</form>
+  <form method="post" action="/otp/request">
+    <input name="phone" placeholder="5333312520" autocomplete="tel" required />
+    <input type="hidden" name="base_grant_url" value="${escapeAttr(base_grant_url)}" />
+    <input type="hidden" name="user_continue_url" value="${escapeAttr(user_continue_url)}" />
+    <input type="hidden" name="client_mac" value="${escapeAttr(client_mac)}" />
+    <button type="submit">Kod Al</button>
+  </form>
 
-<p class="small">Mode: <b>${escapeHtml(OTP_MODE)}</b> (OTP_MODE env ile değişir)</p>
+  <p class="small">Mode: <b>${escapeHtml(OTP_MODE)}</b></p>
 </body>
 </html>`;
 }
 
-function renderOtpPage({ marker, last4, base_grant_url, user_continue_url, client_mac, code, screenFallback }) {
-  const codeBlock = screenFallback
+function renderOtpPage({ marker, last4, base_grant_url, user_continue_url, client_mac, code }) {
+  const codeBlock = OTP_MODE === "screen"
     ? `<p><b>Kod (test):</b> <span style="font-size:28px;letter-spacing:2px">${escapeHtml(code)}</span></p>`
-    : `<p class="small">Kod SMS ile gönderildi. (Son 4: ${escapeHtml(last4)})</p>`;
+    : `<p class="small">Kod SMS ile gönderildi. (Son 4: ${escapeHtml(last4 || "")})</p>`;
 
   return `<!doctype html>
 <html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kod Doğrulama</title>
-<style>
-body{font-family:system-ui,Arial;margin:24px;max-width:520px}
-input,button{font-size:16px;padding:10px;width:100%;margin:8px 0}
-.small{color:#666;font-size:13px}
-</style>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kod Doğrulama</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:24px;max-width:520px}
+    input,button{font-size:16px;padding:10px;width:100%;margin:8px 0}
+    .small{color:#666;font-size:13px}
+  </style>
 </head>
 <body>
-<h2>Kod Doğrulama</h2>
-${codeBlock}
+  <h2>Kod Doğrulama</h2>
+  ${codeBlock}
 
-<form method="post" action="/otp/verify">
-  <input name="code" placeholder="6 haneli kod" inputmode="numeric" pattern="\\d{6}" required />
-  <input type="hidden" name="marker" value="${escapeAttr(marker)}" />
-  <button type="submit">Onayla & İnternete Bağlan</button>
-</form>
+  <form method="post" action="/otp/verify">
+    <input name="code" placeholder="6 haneli kod" inputmode="numeric" pattern="\\d{6}" required />
+    <input type="hidden" name="marker" value="${escapeAttr(marker)}" />
+    <button type="submit">Onayla & İnternete Bağlan</button>
+  </form>
 
-<form method="get" action="/">
-  <input type="hidden" name="base_grant_url" value="${escapeAttr(base_grant_url)}" />
-  <input type="hidden" name="user_continue_url" value="${escapeAttr(user_continue_url)}" />
-  <input type="hidden" name="client_mac" value="${escapeAttr(client_mac)}" />
-  <button type="submit">Baştan Başla</button>
-</form>
+  <form method="get" action="/">
+    <input type="hidden" name="base_grant_url" value="${escapeAttr(base_grant_url)}" />
+    <input type="hidden" name="user_continue_url" value="${escapeAttr(user_continue_url)}" />
+    <input type="hidden" name="client_mac" value="${escapeAttr(client_mac)}" />
+    <button type="submit">Baştan Başla</button>
+  </form>
 
-<p class="small">Marker: ${escapeHtml(marker)}</p>
+  <p class="small">Marker: ${escapeHtml(marker)}</p>
 </body>
 </html>`;
 }
 
 function renderError(msg, { base_grant_url = "", user_continue_url = "", client_mac = "" }) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hata</title></head><body style="font-family:system-ui,Arial;margin:24px;max-width:520px">
-<h3>Hata</h3>
-<p>${escapeHtml(msg)}</p>
-<a href="/?base_grant_url=${encodeURIComponent(base_grant_url)}&user_continue_url=${encodeURIComponent(user_continue_url)}&client_mac=${encodeURIComponent(client_mac)}">Geri dön</a>
-</body></html>`;
+  return `<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hata</title></head>
+<body style="font-family:system-ui,Arial;margin:24px;max-width:520px">
+  <h3>Hata</h3>
+  <p>${escapeHtml(msg)}</p>
+  <a href="/?base_grant_url=${encodeURIComponent(base_grant_url)}&user_continue_url=${encodeURIComponent(user_continue_url)}&client_mac=${encodeURIComponent(client_mac)}">Geri dön</a>
+</body>
+</html>`;
 }
 
-function escapeHtml(s) {
-  return String(s ?? "")
+function escapeHtml(v) {
+  return s(v)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
-function escapeAttr(s) {
-  return escapeHtml(s).replaceAll("`", "&#096;");
+function escapeAttr(v) {
+  return escapeHtml(v).replaceAll("`", "&#096;");
 }
 
-// ---- start ----
-let server = null;
+// ---------- Start ----------
+let server;
 
 (async () => {
   redis = await initRedis();
+  if (!redis) {
+    // Redis şart; kalıcı store istiyoruz. Ama yine de ayağa kalksın:
+    // (istersen burada process.exit(1) yaparız)
+    console.log("WARN: Redis not available; rate-limit/lock features disabled.");
+  } else {
+    console.log("ENV:", {
+      OTP_MODE,
+      OTP_TTL_SECONDS,
+      RL_MAC_SECONDS,
+      RL_MSISDN_SECONDS,
+      MAX_WRONG_ATTEMPTS,
+      LOCK_SECONDS
+    });
+  }
 
   server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
 })();
 
-// Railway SIGTERM normal (redeploy/scale). Graceful shutdown:
+// Graceful shutdown (Railway SIGTERM)
 process.on("SIGTERM", async () => {
   try {
     console.log("SIGTERM received. Shutting down...");
