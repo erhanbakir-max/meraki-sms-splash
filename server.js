@@ -415,4 +415,43 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 // Init Redis after server starts (non-blocking start)
 initRedisIfAvailable().catch((e) => {
   console.error("STORE_INIT_FAIL", e?.message || e);
+  // ---- Graceful shutdown (Railway SIGTERM fix) ----
+let shuttingDown = false;
+
+async function gracefulExit(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`SHUTDOWN ${signal}`);
+
+  try {
+    // Eğer redis client kullanıyorsan ve değişkenin adı "redis" ise:
+    if (globalThis.redis && typeof globalThis.redis.quit === "function") {
+      await globalThis.redis.quit();
+      console.log("REDIS_QUIT_OK");
+    }
+  } catch (e) {
+    console.log("REDIS_QUIT_FAIL", e?.message || String(e));
+  }
+
+  // Express/http server varsa:
+  try {
+    if (globalThis.server && typeof globalThis.server.close === "function") {
+      globalThis.server.close(() => {
+        console.log("HTTP_CLOSED");
+        process.exit(0);
+      });
+      // 2 sn sonra zorla çık
+      setTimeout(() => process.exit(0), 2000).unref();
+      return;
+    }
+  } catch {}
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulExit("SIGTERM"));
+process.on("SIGINT", () => gracefulExit("SIGINT"));
+
 });
+
