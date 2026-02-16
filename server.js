@@ -1,61 +1,52 @@
 /**
- * meraki-sms-splash - server.js (single file)
- * - Splash OTP flow (screen mode supported)
- * - PostgreSQL logging
- * - Admin UI (/admin/logs)
- * - 5651 daily packaging + hash chain + HMAC signature
+ * meraki-sms-splash - single-file server.js
+ * - No "basic-auth" dependency (manual basic auth)
+ * - No "ioredis" dependency (in-memory rate limit + OTP store)
+ * - Uses only: built-in node modules + "pg"
  *
  * ENV:
  *   PORT=8080
  *   DATABASE_URL=postgres://...
- *   REDIS_URL=redis://... (optional)
  *   TZ=Europe/Istanbul
- *   OTP_MODE=screen|sms   (default: screen)
+ *   ADMIN_USER=...
+ *   ADMIN_PASS=...
+ *   OTP_MODE=screen|sms  (screen shows otp on page)
  *   OTP_TTL_SECONDS=180
  *   RL_MAC_SECONDS=30
  *   RL_PHONE_SECONDS=60
  *   MAX_WRONG_ATTEMPTS=5
  *   LOCK_SECONDS=600
- *   KVKK_VERSION=YYYY-MM-DD-placeholder
- *   ADMIN_USER=...
- *   ADMIN_PASS=...
- *   DAILY_HMAC_SECRET=... (for signature)
+ *   KVKK_VERSION=2026-02-12-placeholder
+ *   DAILY_HMAC_SECRET=... (required for daily signing)
  */
 
-'use strict';
+"use strict";
 
-const crypto = require('crypto');
-const express = require('express');
-const { Pool } = require('pg');
+const http = require("http");
+const { URL } = require("url");
+const crypto = require("crypto");
+const querystring = require("querystring");
+const { Pool } = require("pg");
 
-let Redis = null;
-try { Redis = require('ioredis'); } catch (_) { /* optional */ }
+// ------------------ ENV ------------------
+const PORT = parseInt(process.env.PORT || "8080", 10);
+const TZ = process.env.TZ || "Europe/Istanbul";
+const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen|sms
+const OTP_TTL_SECONDS = parseInt(process.env.OTP_TTL_SECONDS || "180", 10);
+const RL_MAC_SECONDS = parseInt(process.env.RL_MAC_SECONDS || "30", 10);
+const RL_PHONE_SECONDS = parseInt(process.env.RL_PHONE_SECONDS || "60", 10);
+const MAX_WRONG_ATTEMPTS = parseInt(process.env.MAX_WRONG_ATTEMPTS || "5", 10);
+const LOCK_SECONDS = parseInt(process.env.LOCK_SECONDS || "600", 10);
+const KVKK_VERSION = process.env.KVKK_VERSION || "2026-02-12-placeholder";
 
-const app = express();
-app.set('trust proxy', true);
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json({ limit: '256kb' }));
+const ADMIN_USER = process.env.ADMIN_USER || "";
+const ADMIN_PASS = process.env.ADMIN_PASS || "";
 
-// -------------------- ENV --------------------
-const PORT = parseInt(process.env.PORT || '8080', 10);
-const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_CONNECTION_STRING;
-const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_CONNECTION_STRING;
+const DAILY_HMAC_SECRET = process.env.DAILY_HMAC_SECRET || ""; // required for 5651 daily signing
 
-const TZ = process.env.TZ || 'Europe/Istanbul';
-const OTP_MODE = (process.env.OTP_MODE || 'screen').toLowerCase(); // screen|sms
-const OTP_TTL_SECONDS = parseInt(process.env.OTP_TTL_SECONDS || '180', 10);
-const RL_MAC_SECONDS = parseInt(process.env.RL_MAC_SECONDS || '30', 10);
-const RL_PHONE_SECONDS = parseInt(process.env.RL_PHONE_SECONDS || process.env.RL_MSISDN_SECONDS || '60', 10);
-const MAX_WRONG_ATTEMPTS = parseInt(process.env.MAX_WRONG_ATTEMPTS || '5', 10);
-const LOCK_SECONDS = parseInt(process.env.LOCK_SECONDS || '600', 10);
-const KVKK_VERSION = process.env.KVKK_VERSION || '2026-02-12-placeholder';
+const DB_SET = !!process.env.DATABASE_URL;
 
-const ADMIN_USER = process.env.ADMIN_USER || '';
-const ADMIN_PASS = process.env.ADMIN_PASS || '';
-
-const DAILY_HMAC_SECRET = process.env.DAILY_HMAC_SECRET || ''; // if empty, signature will be null
-
-console.log('ENV:', {
+console.log("ENV:", {
   OTP_MODE,
   OTP_TTL_SECONDS,
   RL_MAC_SECONDS,
@@ -64,969 +55,1017 @@ console.log('ENV:', {
   LOCK_SECONDS,
   KVKK_VERSION,
   TZ,
-  DB_SET: !!DATABASE_URL,
-  REDIS_SET: !!REDIS_URL,
+  DB_SET,
   ADMIN_USER_SET: !!ADMIN_USER,
   ADMIN_PASS_SET: !!ADMIN_PASS,
   DAILY_HMAC_SET: !!DAILY_HMAC_SECRET,
 });
 
-// -------------------- DB --------------------
-if (!DATABASE_URL) {
-  console.error('DATABASE_URL not set. Exiting.');
-  process.exit(1);
-}
-const pool = new Pool({ connectionString: DATABASE_URL });
+// ------------------ DB ------------------
+const pool = DB_SET ? new Pool({ connectionString: process.env.DATABASE_URL, max: 5 }) : null;
 
-async function q(text, params) {
-  return pool.query(text, params);
-}
 async function qRows(text, params) {
-  const r = await q(text, params);
+  const r = await pool.query(text, params);
   return r.rows;
 }
 
-async function ensureSchema() {
-  // access_logs basic + optional columns we evolved during debug
-  await q(`
-    CREATE TABLE IF NOT EXISTS access_logs (
-      id bigserial PRIMARY KEY,
-      created_at timestamptz NOT NULL DEFAULT now(),
-      event text NOT NULL,
-      first_name text,
-      last_name text,
-      phone text,
-      kvkk_accepted bool,
-      kvkk_version text,
-      marker text,
-      client_mac text,
-      client_ip text,        -- TEXT (as you confirmed)
-      ssid text,
-      ap_name text,
-      base_grant_url text,
-      continue_url text,
-      user_continue_url text,
-      grant_url text,
-      full_name text,
-      public_ip text,
-      user_agent text,
-      accept_language text,
-      extra text,
-      meta jsonb NOT NULL DEFAULT '{}'::jsonb
-    );
-  `);
+let accessLogsCols = null; // Set of column names
+let dailyHashesCols = null;
+let dailyPackagesCols = null;
 
-  // daily tables for 5651 packaging
-  await q(`
-    CREATE TABLE IF NOT EXISTS daily_packages (
-      day date NOT NULL,
-      tz text NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now(),
-      record_count int NOT NULL,
-      package jsonb NOT NULL,
-      PRIMARY KEY(day, tz)
-    );
-  `);
+async function loadTableColumns(tableName) {
+  const rows = await qRows(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = $1
+    `,
+    [tableName]
+  );
+  return new Set(rows.map((r) => r.column_name));
+}
 
-  await q(`
+async function ensureTables() {
+  // access_logs: we won't enforce schema; you already have it.
+  // We WILL create daily_* tables if missing (safe).
+  await qRows(
+    `
     CREATE TABLE IF NOT EXISTS daily_hashes (
       day date NOT NULL,
       tz text NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now(),
       record_count int NOT NULL,
       day_hash text NOT NULL,
-      signature text,
-      PRIMARY KEY(day, tz)
+      prev_day_hash text,
+      chain_hash text NOT NULL,
+      algo text NOT NULL DEFAULT 'sha256',
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (day, tz)
     );
-  `);
+    `,
+    []
+  );
 
-  await q(`
+  await qRows(
+    `
+    CREATE TABLE IF NOT EXISTS daily_packages (
+      day date NOT NULL,
+      tz text NOT NULL,
+      package_json jsonb NOT NULL,
+      hmac text NOT NULL,
+      algo text NOT NULL DEFAULT 'hmac-sha256',
+      signed_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (day, tz)
+    );
+    `,
+    []
+  );
+
+  // Optional: daily_chains for history (not required, but you had it)
+  await qRows(
+    `
     CREATE TABLE IF NOT EXISTS daily_chains (
       day date NOT NULL,
       tz text NOT NULL,
-      created_at timestamptz NOT NULL DEFAULT now(),
-      prev_day_hash text,
       chain_hash text NOT NULL,
-      PRIMARY KEY(day, tz)
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (day, tz)
     );
-  `);
+    `,
+    []
+  );
+}
 
-  console.log('DATABASE: table ready');
+async function initDb() {
+  if (!pool) return;
+  try {
+    await pool.query("SELECT 1");
+    console.log("DATABASE: connected");
+    await ensureTables();
+    console.log("DATABASE: table ready");
+    accessLogsCols = await loadTableColumns("access_logs");
+    dailyHashesCols = await loadTableColumns("daily_hashes");
+    dailyPackagesCols = await loadTableColumns("daily_packages");
+  } catch (e) {
+    console.error("DATABASE INIT ERROR:", e);
+    throw e;
+  }
+}
 
-  // Backward-compat migrations (if table existed without columns)
-  // This prevents "column does not exist" crashes.
-  const cols = [
-    ['continue_url', 'text'],
-    ['user_continue_url', 'text'],
-    ['grant_url', 'text'],
-    ['full_name', 'text'],
-    ['public_ip', 'text'],
-    ['user_agent', 'text'],
-    ['accept_language', 'text'],
-    ['extra', 'text'],
-    ['meta', 'jsonb'],
-    ['base_grant_url', 'text'],
-    ['ssid', 'text'],
-    ['ap_name', 'text'],
-    ['first_name', 'text'],
-    ['last_name', 'text'],
-    ['kvkk_accepted', 'bool'],
-    ['kvkk_version', 'text'],
-    ['marker', 'text'],
-    ['client_mac', 'text'],
-    ['client_ip', 'text'],
-    ['phone', 'text'],
-  ];
+// Build dynamic insert for access_logs
+function buildAccessLogInsert(payload) {
+  // payload keys should match intended columns.
+  // We'll only include columns that exist in access_logs.
+  const cols = [];
+  const vals = [];
+  const params = [];
 
-  for (const [name, typ] of cols) {
-    try {
-      await q(`ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS ${name} ${typ};`);
-      if (name === 'meta') {
-        await q(`ALTER TABLE access_logs ALTER COLUMN meta SET DEFAULT '{}'::jsonb;`);
-        await q(`UPDATE access_logs SET meta='{}'::jsonb WHERE meta IS NULL;`);
-      }
-    } catch (e) {
-      console.warn('DB MIGRATION WARN:', name, e.message);
+  for (const [k, v] of Object.entries(payload)) {
+    if (accessLogsCols && accessLogsCols.has(k)) {
+      cols.push(k);
+      vals.push(`$${vals.length + 1}`);
+      params.push(v);
     }
   }
+
+  // If no columns match, skip
+  if (!cols.length) return null;
+
+  // jsonb handling if meta exists
+  // If meta exists and is object, we pass JSON string; pg will cast if column is jsonb
+  return {
+    sql: `INSERT INTO access_logs(${cols.join(", ")}) VALUES(${vals.join(", ")})`,
+    params,
+  };
 }
 
-// -------------------- Redis / Rate limit --------------------
-const redis = REDIS_URL && Redis ? new Redis(REDIS_URL, { maxRetriesPerRequest: 2 }) : null;
-if (redis) {
-  redis.on('connect', () => console.log('REDIS: connected'));
-  redis.on('error', (e) => console.warn('REDIS: error', e.message));
-} else {
-  console.log('REDIS: not configured (or ioredis missing), using in-memory fallbacks');
-}
+async function logAccess(event, ctx) {
+  if (!pool || !accessLogsCols) return;
 
-const mem = new Map(); // fallback store
+  // prefer storing extra fields in meta json if meta column exists
+  const metaObj = {
+    user_agent: ctx.user_agent || null,
+    accept_language: ctx.accept_language || null,
+    referrer: ctx.referrer || null,
+    rawQuery: ctx.rawQuery || null,
+    public_ip: ctx.public_ip || null,
+    mode: ctx.mode || null,
+  };
 
-async function kvGet(key) {
-  if (redis) return redis.get(key);
-  const v = mem.get(key);
-  if (!v) return null;
-  if (v.expiresAt && Date.now() > v.expiresAt) { mem.delete(key); return null; }
-  return v.value;
-}
-async function kvSet(key, value, ttlSeconds) {
-  if (redis) return redis.set(key, value, 'EX', ttlSeconds);
-  mem.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
-}
-async function kvIncr(key, ttlSeconds) {
-  if (redis) {
-    const multi = redis.multi();
-    multi.incr(key);
-    multi.expire(key, ttlSeconds);
-    const res = await multi.exec();
-    return parseInt(res[0][1], 10);
-  }
-  const cur = parseInt((await kvGet(key)) || '0', 10) + 1;
-  await kvSet(key, String(cur), ttlSeconds);
-  return cur;
-}
+  const payload = {
+    event,
+    created_at: ctx.created_at || new Date().toISOString(),
+    first_name: ctx.first_name || null,
+    last_name: ctx.last_name || null,
+    phone: ctx.phone || null,
+    client_mac: ctx.client_mac || null,
+    client_ip: ctx.client_ip || null,
+    ssid: ctx.ssid || null,
+    ap_name: ctx.ap_name || null,
+    base_grant_url: ctx.base_grant_url || null,
+    continue_url: ctx.continue_url || null,
+    marker: ctx.marker || null,
+    kvkk_accepted: typeof ctx.kvkk_accepted === "boolean" ? ctx.kvkk_accepted : null,
+    kvkk_version: ctx.kvkk_version || KVKK_VERSION,
+    // If you have these columns they will be used, else dropped automatically:
+    gateway_id: ctx.gateway_id || null,
+    node_id: ctx.node_id || null,
+    node_mac: ctx.node_mac || null,
+    user_continue_url: ctx.user_continue_url || null,
+    full_name: ctx.full_name || null,
+    meta: accessLogsCols.has("meta") ? JSON.stringify(metaObj) : undefined,
+  };
 
-// -------------------- Helpers --------------------
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function sha256hex(s) {
-  return crypto.createHash('sha256').update(s).digest('hex');
-}
-
-function hmacHex(secret, s) {
-  return crypto.createHmac('sha256', secret).update(s).digest('hex');
-}
-
-function cleanPhone(p) {
-  if (!p) return '';
-  let x = String(p).trim();
-  x = x.replace(/\s+/g, '');
-  // keep + and digits only
-  x = x.replace(/[^\d+]/g, '');
-  return x;
-}
-
-function cleanMac(m) {
-  if (!m) return '';
-  return String(m).trim().toLowerCase();
-}
-
-function getClientIp(req) {
-  // meraki sends client_ip in query; else use express ip
-  return (req.query.client_ip || req.body.client_ip || req.ip || '').toString();
-}
-
-function getPublicIp(req) {
-  // try common proxy headers; else blank
-  const xff = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim();
-  return xff || '';
-}
-
-function toDayStrInTZ(date = new Date(), tz = TZ) {
-  // YYYY-MM-DD for a TZ using Intl
-  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  return fmt.format(date); // "2026-02-16"
-}
-
-function fmtLocal(dtIsoOrDate, tz = TZ) {
-  const d = (dtIsoOrDate instanceof Date) ? dtIsoOrDate : new Date(dtIsoOrDate);
-  const fmt = new Intl.DateTimeFormat('tr-TR', {
-    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  return fmt.format(d).replace(',', '');
-}
-
-function parseBasicAuth(req) {
-  const h = req.headers.authorization || '';
-  if (!h.startsWith('Basic ')) return null;
-  const raw = Buffer.from(h.slice(6), 'base64').toString('utf8');
-  const idx = raw.indexOf(':');
-  if (idx < 0) return null;
-  return { user: raw.slice(0, idx), pass: raw.slice(idx + 1) };
-}
-
-function requireAdmin(req, res, next) {
-  if (!ADMIN_USER || !ADMIN_PASS) {
-    return res.status(403).send('Admin credentials not set (ADMIN_USER/ADMIN_PASS).');
-  }
-  const creds = parseBasicAuth(req);
-  if (!creds || creds.user !== ADMIN_USER || creds.pass !== ADMIN_PASS) {
-    res.set('WWW-Authenticate', 'Basic realm="admin"');
-    return res.status(401).send('Auth required');
-  }
-  return next();
-}
-
-// -------------------- Logging --------------------
-async function logEvent(event, payload) {
-  const {
-    first_name, last_name, phone, kvkk_accepted, kvkk_version, marker,
-    client_mac, client_ip, ssid, ap_name,
-    base_grant_url, continue_url, user_continue_url, grant_url,
-    full_name, public_ip, user_agent, accept_language, extra, meta
-  } = payload || {};
+  const ins = buildAccessLogInsert(payload);
+  if (!ins) return;
 
   try {
-    await q(`
-      INSERT INTO access_logs(
-        event, first_name, last_name, phone, kvkk_accepted, kvkk_version, marker,
-        client_mac, client_ip, ssid, ap_name,
-        base_grant_url, continue_url, user_continue_url, grant_url,
-        full_name, public_ip, user_agent, accept_language, extra, meta
-      )
-      VALUES(
-        $1,$2,$3,$4,$5,$6,$7,
-        $8,$9,$10,$11,
-        $12,$13,$14,$15,
-        $16,$17,$18,$19,$20,$21::jsonb
-      )
-    `, [
-      event,
-      first_name || null,
-      last_name || null,
-      phone || null,
-      (kvkk_accepted === undefined ? null : !!kvkk_accepted),
-      kvkk_version || null,
-      marker || null,
-      client_mac || null,
-      client_ip || null,
-      ssid || null,
-      ap_name || null,
-      base_grant_url || null,
-      continue_url || null,
-      user_continue_url || null,
-      grant_url || null,
-      full_name || null,
-      public_ip || null,
-      user_agent || null,
-      accept_language || null,
-      extra || null,
-      JSON.stringify(meta || {}),
-    ]);
+    await qRows(ins.sql, ins.params);
   } catch (e) {
-    // do not crash on logging
-    console.warn('DB LOG ERROR:', e.message);
+    // Don't crash app for logging schema drift
+    console.error("DB LOG ERROR:", e.message);
   }
 }
 
-// -------------------- OTP --------------------
-function genOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+// ------------------ In-memory stores (OTP + rate limit) ------------------
+const otpStore = new Map(); // marker -> { otp, exp, phone, first_name, last_name, mac, ip, lockUntil, wrongCount }
+const rateStore = new Map(); // key -> { count, resetAt }
+
+function nowMs() {
+  return Date.now();
 }
+
 function genMarker() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-async function otpKey(mac) {
-  return `otp:${mac}`;
-}
-async function wrongKey(mac) {
-  return `wrong:${mac}`;
-}
-async function lockKey(mac) {
-  return `lock:${mac}`;
-}
-async function rlKeyMac(mac) {
-  return `rl:mac:${mac}`;
-}
-async function rlKeyPhone(phone) {
-  return `rl:phone:${phone}`;
+function genOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-async function isLocked(mac) {
-  const v = await kvGet(await lockKey(mac));
-  return v === '1';
-}
-
-async function lock(mac) {
-  await kvSet(await lockKey(mac), '1', LOCK_SECONDS);
-}
-
-async function rateLimitOrThrow({ mac, phone }) {
-  const macCount = await kvIncr(await rlKeyMac(mac), RL_MAC_SECONDS);
-  if (macCount > 20) throw new Error('Rate limit exceeded (MAC).');
-
-  if (phone) {
-    const phoneCount = await kvIncr(await rlKeyPhone(phone), RL_PHONE_SECONDS);
-    if (phoneCount > 20) throw new Error('Rate limit exceeded (PHONE).');
+function rateHit(key, windowSeconds, limit) {
+  const t = nowMs();
+  const row = rateStore.get(key);
+  if (!row || t >= row.resetAt) {
+    rateStore.set(key, { count: 1, resetAt: t + windowSeconds * 1000 });
+    return { ok: true, remaining: limit - 1 };
   }
+  row.count += 1;
+  if (row.count > limit) return { ok: false, remaining: 0 };
+  return { ok: true, remaining: limit - row.count };
 }
 
-// -------------------- Splash UI --------------------
-function splashHtml({ marker, client_mac, otpMode, otpScreenCode, msg }) {
-  const darkCss = `
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:0}
-    .wrap{max-width:820px;margin:40px auto;padding:24px}
-    .card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:18px}
-    h1{font-size:22px;margin:0 0 12px}
-    label{display:block;margin:10px 0 6px;color:#b9c7ff;font-size:13px}
-    input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:#fff}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    .btn{margin-top:14px;display:inline-block;background:#6d5efc;border:none;color:#fff;padding:10px 14px;border-radius:12px;cursor:pointer}
-    .muted{color:#a9b6e6;font-size:12px;margin-top:10px}
-    .otpbox{margin-top:10px;padding:12px;border-radius:12px;background:rgba(109,94,252,0.15);border:1px solid rgba(109,94,252,0.35)}
-    code{font-size:18px;letter-spacing:2px}
-    a{color:#9aa8ff}
+function safeStr(x, max = 500) {
+  if (x === undefined || x === null) return "";
+  const s = String(x);
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function parseCookies(req) {
+  const h = req.headers["cookie"] || "";
+  const out = {};
+  h.split(";").forEach((part) => {
+    const i = part.indexOf("=");
+    if (i > -1) {
+      const k = part.slice(0, i).trim();
+      const v = decodeURIComponent(part.slice(i + 1).trim());
+      out[k] = v;
+    }
+  });
+  return out;
+}
+
+function setCookie(res, name, value, opts = {}) {
+  let c = `${name}=${encodeURIComponent(value)}`;
+  if (opts.httpOnly) c += "; HttpOnly";
+  if (opts.sameSite) c += `; SameSite=${opts.sameSite}`;
+  if (opts.path) c += `; Path=${opts.path}`;
+  if (opts.maxAge) c += `; Max-Age=${opts.maxAge}`;
+  res.setHeader("Set-Cookie", c);
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => resolve(data));
+  });
+}
+
+// ------------------ Basic Auth (no dependency) ------------------
+function unauthorized(res) {
+  res.statusCode = 401;
+  res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
+  res.end("Unauthorized");
+}
+
+function requireAdmin(req, res) {
+  if (!ADMIN_USER || !ADMIN_PASS) return unauthorized(res);
+  const h = req.headers["authorization"] || "";
+  if (!h.startsWith("Basic ")) return unauthorized(res);
+
+  const b64 = h.slice(6).trim();
+  let userpass = "";
+  try {
+    userpass = Buffer.from(b64, "base64").toString("utf8");
+  } catch {
+    return unauthorized(res);
+  }
+  const idx = userpass.indexOf(":");
+  if (idx < 0) return unauthorized(res);
+  const user = userpass.slice(0, idx);
+  const pass = userpass.slice(idx + 1);
+  if (user !== ADMIN_USER || pass !== ADMIN_PASS) return unauthorized(res);
+  return true;
+}
+
+// ------------------ HTML helpers ------------------
+function htmlEscape(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function layout(title, body) {
+  return `<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${htmlEscape(title)}</title>
+<style>
+  :root { color-scheme: dark; }
+  body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1020;color:#e7eaf0}
+  .wrap{max-width:980px;margin:0 auto;padding:24px}
+  .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:18px;backdrop-filter: blur(10px)}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  input,button{border-radius:10px;border:1px solid rgba(255,255,255,.12);padding:10px 12px;background:rgba(0,0,0,.25);color:#e7eaf0}
+  button{cursor:pointer;background:#5865f2;border-color:#5865f2}
+  a{color:#9db2ff}
+  table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
+  th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.08);text-align:left;vertical-align:top}
+  th{font-weight:600;color:#cdd3ff}
+  .muted{opacity:.75;font-size:12px}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;background:rgba(88,101,242,.18);border:1px solid rgba(88,101,242,.35);font-size:12px}
+  .otp{font-size:28px;letter-spacing:3px;font-weight:800}
+</style>
+</head>
+<body>
+<div class="wrap">
+  ${body}
+</div>
+</body>
+</html>`;
+}
+
+function splashPage(ctx) {
+  const hasContinue = !!ctx.continue_url;
+  const hasClientMac = !!ctx.client_mac;
+  const hasBaseGrant = !!ctx.base_grant_url;
+
+  console.log("SPLASH_OPEN", { hasBaseGrant, hasContinue, hasClientMac, mode: OTP_MODE });
+
+  const info = `
+    <div class="muted">
+      KVKK version: <span class="pill">${htmlEscape(KVKK_VERSION)}</span> ·
+      TZ: <span class="pill">${htmlEscape(TZ)}</span>
+    </div>
+    <div class="muted" style="margin-top:8px">
+      client_mac: <b>${htmlEscape(ctx.client_mac || "-")}</b> · client_ip: <b>${htmlEscape(ctx.client_ip || "-")}</b>
+    </div>
   `;
 
-  const otpBlock = (otpMode === 'screen' && otpScreenCode)
-    ? `<div class="otpbox"><div class="muted">OTP (screen mode):</div><code>${otpScreenCode}</code></div>`
-    : `<div class="muted">OTP SMS ile iletilecek (sms mode).</div>`;
+  const otpBlock = (ctx.otp && OTP_MODE === "screen")
+    ? `<div style="margin-top:14px" class="card">
+         <div class="muted">OTP (ekranda gösterim modu)</div>
+         <div class="otp">${htmlEscape(ctx.otp)}</div>
+       </div>`
+    : "";
 
-  const info = msg ? `<div class="otpbox">${msg}</div>` : '';
-
-  return `<!doctype html>
-  <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Meraki Splash</title>
-  <style>${darkCss}</style></head>
-  <body><div class="wrap">
+  return layout("Meraki SMS Splash", `
     <div class="card">
-      <h1>Wi-Fi Erişimi</h1>
-      <div class="muted">Marker: <b>${marker || ''}</b> · MAC: <b>${client_mac || ''}</b></div>
-      ${otpBlock}
+      <h2 style="margin:0 0 10px 0">İnternet Erişimi</h2>
       ${info}
-      <form method="POST" action="/otp/verify">
-        <input type="hidden" name="marker" value="${marker || ''}">
-        <input type="hidden" name="client_mac" value="${client_mac || ''}">
+      <form method="POST" action="/otp/request" style="margin-top:14px">
         <div class="row">
-          <div>
-            <label>Ad</label>
-            <input name="first_name" autocomplete="given-name" required>
-          </div>
-          <div>
-            <label>Soyad</label>
-            <input name="last_name" autocomplete="family-name" required>
-          </div>
+          <input name="first_name" placeholder="Ad" required value="${htmlEscape(ctx.first_name || "")}"/>
+          <input name="last_name" placeholder="Soyad" required value="${htmlEscape(ctx.last_name || "")}"/>
+          <input name="phone" placeholder="Telefon (05xx...)" required value="${htmlEscape(ctx.phone || "")}"/>
         </div>
-        <label>Telefon</label>
-        <input name="phone" autocomplete="tel" placeholder="+905xxxxxxxxx" required>
-        <label>OTP</label>
-        <input name="otp" inputmode="numeric" placeholder="6 hane" required>
-        <label style="display:flex;gap:8px;align-items:center;margin-top:10px">
-          <input type="checkbox" name="kvkk_accepted" value="true" required style="width:auto">
-          KVKK metnini okudum ve onaylıyorum.
-        </label>
-        <button class="btn" type="submit">Bağlan</button>
+        <div style="margin-top:10px" class="row">
+          <label class="muted"><input type="checkbox" name="kvkk" value="1" required/> KVKK metnini okudum, kabul ediyorum.</label>
+        </div>
+        <div style="margin-top:12px" class="row">
+          <button type="submit">OTP Talep Et</button>
+          <span class="muted">OTP TTL: ${OTP_TTL_SECONDS}s</span>
+        </div>
       </form>
-      <div class="muted">KVKK_VERSION: ${KVKK_VERSION} · TZ: ${TZ}</div>
-    </div>
-  </div></body></html>`;
-}
 
-// -------------------- Routes --------------------
-app.get('/', async (req, res) => {
-  // Meraki splash open params (commonly)
-  const base_grant_url = req.query.base_grant_url || '';
-  const user_continue_url = req.query.user_continue_url || '';
-  const continue_url = req.query.continue_url || '';
-  const client_mac = cleanMac(req.query.client_mac || req.query.clientMac || '');
-  const client_ip = (req.query.client_ip || '').toString();
-  const ssid = (req.query.ssid || '').toString();
-  const ap_name = (req.query.ap_name || '').toString();
+      ${otpBlock}
 
-  console.log('SPLASH_OPEN', {
-    hasBaseGrant: !!base_grant_url,
-    hasContinue: !!(user_continue_url || continue_url),
-    hasClientMac: !!client_mac,
-    mode: OTP_MODE
-  });
-
-  await logEvent('SPLASH_OPEN', {
-    client_mac,
-    client_ip,
-    ssid,
-    ap_name,
-    base_grant_url,
-    continue_url,
-    user_continue_url,
-    kvkk_version: KVKK_VERSION,
-    public_ip: getPublicIp(req),
-    user_agent: (req.headers['user-agent'] || '').toString(),
-    accept_language: (req.headers['accept-language'] || '').toString(),
-    meta: { query: req.query || {}, mode: OTP_MODE }
-  });
-
-  if (!client_mac) {
-    return res.status(400).send('client_mac missing');
-  }
-
-  // locked?
-  if (await isLocked(client_mac)) {
-    return res.status(429).send('Locked due to too many wrong attempts. Try later.');
-  }
-
-  // Create OTP + marker
-  const otp = genOtp();
-  const marker = genMarker();
-  const record = {
-    otp,
-    marker,
-    created_at: nowIso(),
-    base_grant_url,
-    continue_url,
-    user_continue_url,
-    client_ip,
-    ssid,
-    ap_name
-  };
-
-  try {
-    await rateLimitOrThrow({ mac: client_mac, phone: null });
-  } catch (e) {
-    return res.status(429).send(e.message);
-  }
-
-  await kvSet(await otpKey(client_mac), JSON.stringify(record), OTP_TTL_SECONDS);
-
-  console.log('OTP_CREATED', { marker, last4: '****', client_mac });
-  await logEvent('OTP_CREATED', {
-    marker,
-    client_mac,
-    client_ip,
-    ssid,
-    ap_name,
-    base_grant_url,
-    continue_url,
-    user_continue_url,
-    kvkk_version: KVKK_VERSION,
-    public_ip: getPublicIp(req),
-    user_agent: (req.headers['user-agent'] || '').toString(),
-    accept_language: (req.headers['accept-language'] || '').toString(),
-    meta: { mode: OTP_MODE }
-  });
-
-  // SCREEN mode shows OTP on page
-  let otpScreenCode = null;
-  if (OTP_MODE === 'screen') {
-    otpScreenCode = otp;
-    console.log('OTP_SCREEN_CODE', { marker, otp });
-    await logEvent('OTP_SCREEN_CODE', { marker, client_mac, client_ip, kvkk_version: KVKK_VERSION, meta: { otp_shown: true } });
-  } else {
-    // SMS mode: call smsService.js if exists
-    try {
-      const smsService = require('./smsService');
-      // smsService.sendOtp(phone, otp) will be called after user enters phone (or you can send here if phone is known)
-      // We keep it minimal.
-      await smsService.ping?.();
-    } catch (_) {
-      // ignore
-    }
-  }
-
-  res.set('Cache-Control', 'no-store');
-  return res.status(200).send(splashHtml({
-    marker,
-    client_mac,
-    otpMode: OTP_MODE,
-    otpScreenCode,
-    msg: ''
-  }));
-});
-
-app.post('/otp/verify', async (req, res) => {
-  const client_mac = cleanMac(req.body.client_mac || '');
-  const first_name = (req.body.first_name || '').toString().trim();
-  const last_name = (req.body.last_name || '').toString().trim();
-  const phone = cleanPhone(req.body.phone || '');
-  const otp = (req.body.otp || '').toString().trim();
-  const kvkk_accepted = (req.body.kvkk_accepted || '') === 'true';
-
-  if (!client_mac) return res.status(400).send('client_mac missing');
-  if (!phone) return res.status(400).send('phone missing');
-  if (!otp) return res.status(400).send('otp missing');
-  if (!kvkk_accepted) return res.status(400).send('kvkk missing');
-
-  if (await isLocked(client_mac)) {
-    return res.status(429).send('Locked. Try later.');
-  }
-
-  try {
-    await rateLimitOrThrow({ mac: client_mac, phone });
-  } catch (e) {
-    return res.status(429).send(e.message);
-  }
-
-  const raw = await kvGet(await otpKey(client_mac));
-  if (!raw) {
-    return res.status(410).send('OTP expired. Open splash again.');
-  }
-
-  let rec;
-  try { rec = JSON.parse(raw); } catch { rec = null; }
-  if (!rec || !rec.otp) {
-    return res.status(500).send('OTP state invalid');
-  }
-
-  if (rec.otp !== otp) {
-    const wrong = await kvIncr(await wrongKey(client_mac), LOCK_SECONDS);
-    await logEvent('OTP_VERIFY_FAIL', {
-      marker: rec.marker,
-      client_mac,
-      client_ip: rec.client_ip || null,
-      phone,
-      first_name,
-      last_name,
-      full_name: `${first_name} ${last_name}`.trim(),
-      kvkk_accepted: true,
-      kvkk_version: KVKK_VERSION,
-      meta: { wrong_count: wrong }
-    });
-
-    if (wrong >= MAX_WRONG_ATTEMPTS) {
-      await lock(client_mac);
-      return res.status(429).send('Too many wrong attempts. Locked.');
-    }
-    return res.status(401).send('Wrong OTP');
-  }
-
-  // Verified OK
-  console.log('OTP_VERIFY_OK', { marker: rec.marker, client_mac });
-  await logEvent('OTP_VERIFIED', {
-    marker: rec.marker,
-    client_mac,
-    client_ip: rec.client_ip || null,
-    phone,
-    first_name,
-    last_name,
-    full_name: `${first_name} ${last_name}`.trim(),
-    kvkk_accepted: true,
-    kvkk_version: KVKK_VERSION,
-    base_grant_url: rec.base_grant_url || null,
-    continue_url: rec.continue_url || null,
-    user_continue_url: rec.user_continue_url || null,
-    meta: { verified_at: nowIso() }
-  });
-
-  // Build grant redirect URL (Meraki expects redirect to /grant with required params already in query)
-  // We'll redirect to base_grant_url itself when available.
-  const baseGrant = (rec.base_grant_url || '').toString();
-  if (!baseGrant) {
-    // No base_grant_url (some captures); just show success.
-    return res.status(200).send(splashHtml({
-      marker: rec.marker,
-      client_mac,
-      otpMode: OTP_MODE,
-      otpScreenCode: null,
-      msg: 'OTP doğrulandı. (base_grant_url yok) İnternete çıkış için Meraki tarafında base_grant_url gönderilmeli.'
-    }));
-  }
-
-  // choose continue url
-  const cont = (rec.user_continue_url || rec.continue_url || 'http://connectivitycheck.gstatic.com/generate_204').toString();
-  const grantUrl = new URL(baseGrant);
-  // Meraki: continue_url is typical, keep it if not already present
-  if (!grantUrl.searchParams.get('continue_url')) {
-    grantUrl.searchParams.set('continue_url', cont);
-  }
-
-  const finalGrant = grantUrl.toString();
-  console.log('GRANT_CLIENT_REDIRECT:', finalGrant);
-
-  await logEvent('GRANT_CLIENT_REDIRECT', {
-    marker: rec.marker,
-    client_mac,
-    client_ip: rec.client_ip || null,
-    phone,
-    full_name: `${first_name} ${last_name}`.trim(),
-    kvkk_version: KVKK_VERSION,
-    grant_url: finalGrant,
-    meta: { redirect: true }
-  });
-
-  // Meraki expects redirect
-  res.set('Cache-Control', 'no-store');
-  return res.redirect(302, finalGrant);
-});
-
-// -------------------- Admin UI --------------------
-const adminCss = `
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0}
-  .wrap{max-width:1200px;margin:26px auto;padding:0 16px}
-  h1{margin:0 0 14px;font-size:22px}
-  .card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:16px}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,0.08);vertical-align:top}
-  th{color:#b9c7ff;font-weight:600;text-align:left}
-  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0 14px}
-  input{padding:10px 10px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:#fff}
-  .btn{background:#6d5efc;color:#fff;border:none;border-radius:12px;padding:10px 12px;cursor:pointer}
-  a{color:#9aa8ff;text-decoration:none}
-  .muted{color:#a9b6e6;font-size:12px}
-`;
-
-function adminPage(title, bodyHtml) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${title}</title><style>${adminCss}</style></head><body><div class="wrap">${bodyHtml}</div></body></html>`;
-}
-
-app.get('/admin', requireAdmin, (req, res) => {
-  res.redirect('/admin/logs');
-});
-
-app.get('/admin/logs', requireAdmin, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
-  const tz = (req.query.tz || TZ).toString();
-
-  // If user wants JSON only:
-  const wantsJson = (req.query.json === '1') || (req.headers.accept || '').includes('application/json');
-
-  try {
-    const rows = await qRows(`
-      SELECT id, created_at, event, full_name, phone, client_mac, client_ip, marker, kvkk_version
-      FROM access_logs
-      ORDER BY id DESC
-      LIMIT $1
-    `, [limit]);
-
-    if (wantsJson) {
-      return res.json(rows);
-    }
-
-    const trs = rows.map(r => `
-      <tr>
-        <td>${r.id}</td>
-        <td>${fmtLocal(r.created_at, tz)}</td>
-        <td>${(r.event || '')}</td>
-        <td>${(r.full_name || '')}</td>
-        <td>${(r.phone || '')}</td>
-        <td>${(r.client_mac || '')}</td>
-        <td>${(r.client_ip || '')}</td>
-        <td>${(r.marker || '')}</td>
-        <td>${(r.kvkk_version || '')}</td>
-      </tr>
-    `).join('');
-
-    const body = `
-      <div class="card">
-        <h1>/admin/logs</h1>
+      <form method="POST" action="/otp/verify" style="margin-top:14px">
         <div class="row">
-          <form method="GET" action="/admin/logs" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-            <span class="muted">limit=${limit} · tz=${tz} ·</span>
-            <a class="muted" href="/admin/logs?limit=${limit}&tz=${encodeURIComponent(tz)}&json=1">JSON</a>
-            <input name="limit" value="${limit}" style="width:120px">
-            <input name="tz" value="${tz}" style="width:180px">
-            <button class="btn" type="submit">Refresh</button>
-            <a class="btn" href="/admin/daily" style="display:inline-block;background:#2b365c">Daily</a>
-          </form>
+          <input name="otp" placeholder="OTP" inputmode="numeric" required/>
+          <button type="submit">Bağlan</button>
         </div>
-        <table>
-          <thead><tr>
-            <th>id</th><th>time</th><th>event</th><th>name</th><th>phone</th><th>mac</th><th>ip</th><th>marker</th><th>kvkk</th>
-          </tr></thead>
-          <tbody>${trs}</tbody>
-        </table>
+      </form>
+
+      <div class="muted" style="margin-top:10px">
+        Not: Bu servis logları 5651 uyumu için günlük hash+chain+HMAC ile paketleyebilir.
       </div>
-    `;
-    return res.send(adminPage('admin logs', body));
-  } catch (e) {
-    console.error('admin logs error', e);
-    return res.status(500).send('admin logs error: ' + e.message);
+    </div>
+  `);
+}
+
+function adminLogsPage(rows, params) {
+  const { limit, tz } = params;
+  return layout("/admin/logs", `
+    <div class="card">
+      <h2 style="margin:0 0 10px 0">/admin/logs</h2>
+      <div class="muted">limit=${htmlEscape(limit)} · tz=${htmlEscape(tz)} · <a href="/admin/logs?format=json&limit=${encodeURIComponent(limit)}&tz=${encodeURIComponent(tz)}">JSON</a></div>
+      <div class="row" style="margin-top:10px">
+        <form method="GET" action="/admin/logs" class="row">
+          <input name="limit" value="${htmlEscape(limit)}" style="width:120px"/>
+          <input name="tz" value="${htmlEscape(tz)}" style="width:220px"/>
+          <button type="submit">Refresh</button>
+        </form>
+        <a href="/admin/daily/build?day=${new Date().toISOString().slice(0,10)}" class="pill">Daily</a>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>id</th><th>time</th><th>event</th><th>name</th><th>phone</th><th>mac</th><th>ip</th><th>marker</th><th>kvkk</th>
+          </tr>
+        </thead>
+        <tbody>
+        ${rows
+          .map((r) => {
+            const nm = [r.first_name, r.last_name].filter(Boolean).join(" ");
+            const dt = r.created_at ? new Date(r.created_at).toLocaleString("tr-TR", { timeZone: tz }) : "-";
+            return `<tr>
+              <td>${htmlEscape(r.id ?? "")}</td>
+              <td>${htmlEscape(dt)}</td>
+              <td>${htmlEscape(r.event ?? "")}</td>
+              <td>${htmlEscape(nm)}</td>
+              <td>${htmlEscape(r.phone ?? "")}</td>
+              <td>${htmlEscape(r.client_mac ?? "")}</td>
+              <td>${htmlEscape(r.client_ip ?? "")}</td>
+              <td>${htmlEscape(r.marker ?? "")}</td>
+              <td>${htmlEscape(r.kvkk_version ?? "")}</td>
+            </tr>`;
+          })
+          .join("")}
+        </tbody>
+      </table>
+    </div>
+  `);
+}
+
+// ------------------ Meraki Grant ------------------
+function buildGrantUrl(ctx) {
+  // Meraki expects GET to /grant with required params.
+  // We will redirect user to base_grant_url + forwarded original params.
+  // base_grant_url sample: https://eu.network-auth.com/splash/.../grant
+  const base = ctx.base_grant_url;
+  if (!base) return null;
+
+  const u = new URL(base);
+
+  // Forward common required params if present
+  const forwardKeys = ["gateway_id", "node_id", "client_ip", "client_mac", "node_mac", "continue_url"];
+  for (const k of forwardKeys) {
+    if (ctx[k]) u.searchParams.set(k, ctx[k]);
   }
-});
-
-// -------------------- 5651 Daily packaging / chain / sign --------------------
-function canonicalRecord(r) {
-  // Keep stable order and only key fields required for 5651 style auditing
-  return {
-    id: r.id,
-    created_at: r.created_at,
-    event: r.event,
-    full_name: r.full_name || null,
-    phone: r.phone || null,
-    client_mac: r.client_mac || null,
-    client_ip: r.client_ip || null,
-    marker: r.marker || null,
-    kvkk_version: r.kvkk_version || null,
-    grant_url: r.grant_url || null,
-    user_agent: r.user_agent || null,
-    accept_language: r.accept_language || null,
-    public_ip: r.public_ip || null,
-  };
+  return u.toString();
 }
 
-function stableStringify(obj) {
-  // stable JSON stringify (sorted keys)
-  const allKeys = [];
-  JSON.stringify(obj, (k, v) => { allKeys.push(k); return v; });
-  allKeys.sort();
-  return JSON.stringify(obj, allKeys);
+// ------------------ Daily 5651 (hash + chain + HMAC) ------------------
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+function hmacSha256Hex(secret, s) {
+  return crypto.createHmac("sha256", secret).update(s).digest("hex");
 }
 
-async function buildDaily(dayStr, tz = TZ) {
-  // dayStr: YYYY-MM-DD in tz
-  const rows = await qRows(`
-    SELECT
-      id, created_at, event, full_name, phone, client_mac, client_ip, marker, kvkk_version,
-      grant_url, user_agent, accept_language, public_ip
+async function buildDaily(dayStr, tz) {
+  if (!DAILY_HMAC_SECRET) {
+    return { error: "DAILY_HMAC_SECRET missing" };
+  }
+  // Validate day
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dayStr)) {
+    return { error: "invalid day format, use YYYY-MM-DD" };
+  }
+
+  // Pull logs for that day in tz
+  // created_at is timestamptz (per your screenshot)
+  // Filter: (created_at AT TIME ZONE tz)::date = day::date
+  const logs = await qRows(
+    `
+    SELECT *
     FROM access_logs
-    WHERE (created_at AT TIME ZONE $2)::date = $1::date
-    ORDER BY id ASC
-  `, [dayStr, tz]);
+    WHERE ((created_at AT TIME ZONE $1)::date = $2::date)
+    ORDER BY created_at ASC, id ASC
+    `,
+    [tz, dayStr]
+  );
 
-  const packageObj = {
-    schema: '5651-daily-v1',
-    day: dayStr,
-    tz,
-    created_at: nowIso(),
-    record_count: rows.length,
-    records: rows.map(canonicalRecord),
-  };
-
-  const packageJson = stableStringify(packageObj);
-  const day_hash = sha256hex(packageJson);
-
-  // prev day hash from daily_hashes
-  const prev = await qRows(`
-    SELECT day_hash
-    FROM daily_hashes
-    WHERE day = ($1::date - interval '1 day')::date AND tz = $2
-    LIMIT 1
-  `, [dayStr, tz]);
-  const prev_day_hash = prev[0]?.day_hash || null;
-
-  const chain_material = stableStringify({
-    day: dayStr,
-    tz,
-    day_hash,
-    prev_day_hash,
+  // Canonical JSON lines (stable order)
+  const canonical = logs.map((r) => {
+    // Keep minimal but useful 5651-ish fields (expand if you want)
+    const obj = {
+      id: r.id ?? null,
+      created_at: r.created_at ?? null,
+      event: r.event ?? null,
+      phone: r.phone ?? null,
+      first_name: r.first_name ?? null,
+      last_name: r.last_name ?? null,
+      client_mac: r.client_mac ?? null,
+      client_ip: r.client_ip ?? null,
+      marker: r.marker ?? null,
+      kvkk_version: r.kvkk_version ?? null,
+    };
+    return JSON.stringify(obj);
   });
-  const chain_hash = sha256hex(chain_material);
 
-  const signature = DAILY_HMAC_SECRET ? hmacHex(DAILY_HMAC_SECRET, chain_hash) : null;
+  const dayPayload = canonical.join("\n");
+  const dayHash = sha256Hex(dayPayload);
 
-  // Upsert
-  await q(`
-    INSERT INTO daily_packages(day, tz, record_count, package)
-    VALUES($1::date, $2, $3, $4::jsonb)
-    ON CONFLICT(day, tz) DO UPDATE SET
-      record_count=EXCLUDED.record_count,
-      package=EXCLUDED.package,
-      created_at=now()
-  `, [dayStr, tz, rows.length, JSON.stringify(packageObj)]);
+  const prev = await qRows(
+    `
+    SELECT day_hash, chain_hash
+    FROM daily_hashes
+    WHERE tz = $1 AND day < $2::date
+    ORDER BY day DESC
+    LIMIT 1
+    `,
+    [tz, dayStr]
+  );
 
-  await q(`
-    INSERT INTO daily_hashes(day, tz, record_count, day_hash, signature)
-    VALUES($1::date, $2, $3, $4, $5)
-    ON CONFLICT(day, tz) DO UPDATE SET
+  const prevDayHash = prev[0]?.day_hash || null;
+  const prevChainHash = prev[0]?.chain_hash || null;
+
+  // Chain ties days together
+  const chainInput = JSON.stringify({
+    day: dayStr,
+    tz,
+    day_hash: dayHash,
+    prev_chain_hash: prevChainHash,
+  });
+  const chainHash = sha256Hex(chainInput);
+
+  // Package signed with HMAC (placeholder for real e-imza / KEP / TSA)
+  const packageObj = {
+    day: dayStr,
+    tz,
+    record_count: logs.length,
+    day_hash: dayHash,
+    prev_day_hash: prevDayHash,
+    chain_hash: chainHash,
+    algo: "sha256",
+    generated_at: new Date().toISOString(),
+  };
+  const packageJson = JSON.stringify(packageObj);
+  const hmac = hmacSha256Hex(DAILY_HMAC_SECRET, packageJson);
+
+  // Upsert daily_hashes + daily_packages + daily_chains
+  await qRows(
+    `
+    INSERT INTO daily_hashes(day, tz, record_count, day_hash, prev_day_hash, chain_hash)
+    VALUES($1::date, $2, $3, $4, $5, $6)
+    ON CONFLICT (day, tz) DO UPDATE SET
       record_count=EXCLUDED.record_count,
       day_hash=EXCLUDED.day_hash,
-      signature=EXCLUDED.signature,
-      created_at=now()
-  `, [dayStr, tz, rows.length, day_hash, signature]);
-
-  await q(`
-    INSERT INTO daily_chains(day, tz, prev_day_hash, chain_hash)
-    VALUES($1::date, $2, $3, $4)
-    ON CONFLICT(day, tz) DO UPDATE SET
       prev_day_hash=EXCLUDED.prev_day_hash,
       chain_hash=EXCLUDED.chain_hash,
       created_at=now()
-  `, [dayStr, tz, prev_day_hash, chain_hash]);
+    `,
+    [dayStr, tz, logs.length, dayHash, prevDayHash, chainHash]
+  );
 
-  return { day: dayStr, tz, record_count: rows.length, day_hash, prev_day_hash, chain_hash, signature };
-}
+  await qRows(
+    `
+    INSERT INTO daily_packages(day, tz, package_json, hmac)
+    VALUES($1::date, $2, $3::jsonb, $4)
+    ON CONFLICT (day, tz) DO UPDATE SET
+      package_json=EXCLUDED.package_json,
+      hmac=EXCLUDED.hmac,
+      signed_at=now()
+    `,
+    [dayStr, tz, packageJson, hmac]
+  );
 
-async function verifyDaily(dayStr, tz = TZ) {
-  const p = await qRows(`SELECT package FROM daily_packages WHERE day=$1::date AND tz=$2 LIMIT 1`, [dayStr, tz]);
-  const h = await qRows(`SELECT day_hash, signature, record_count FROM daily_hashes WHERE day=$1::date AND tz=$2 LIMIT 1`, [dayStr, tz]);
-  const c = await qRows(`SELECT prev_day_hash, chain_hash, tz FROM daily_chains WHERE day=$1::date AND tz=$2 LIMIT 1`, [dayStr, tz]);
-
-  if (!p[0] || !h[0] || !c[0]) {
-    return { ok: false, reason: 'missing daily rows (build first?)' };
-  }
-
-  const packageJson = stableStringify(p[0].package);
-  const recomputed_day_hash = sha256hex(packageJson);
-  const dayHashOk = (recomputed_day_hash === h[0].day_hash);
-
-  const chain_material = stableStringify({
-    day: dayStr,
-    tz,
-    day_hash: h[0].day_hash,
-    prev_day_hash: c[0].prev_day_hash || null,
-  });
-  const recomputed_chain_hash = sha256hex(chain_material);
-  const chainOk = (recomputed_chain_hash === c[0].chain_hash);
-
-  const sigOk = DAILY_HMAC_SECRET
-    ? (hmacHex(DAILY_HMAC_SECRET, c[0].chain_hash) === (h[0].signature || ''))
-    : null;
+  await qRows(
+    `
+    INSERT INTO daily_chains(day, tz, chain_hash)
+    VALUES($1::date, $2, $3)
+    ON CONFLICT (day, tz) DO UPDATE SET chain_hash=EXCLUDED.chain_hash, created_at=now()
+    `,
+    [dayStr, tz, chainHash]
+  );
 
   return {
-    ok: dayHashOk && chainOk && (sigOk === null ? true : sigOk),
-    dayHashOk,
-    chainOk,
-    sigOk,
-    recomputed_day_hash,
-    recomputed_chain_hash,
-    stored: {
-      record_count: h[0].record_count,
-      day_hash: h[0].day_hash,
-      chain_hash: c[0].chain_hash,
-      prev_day_hash: c[0].prev_day_hash,
-      signature: h[0].signature,
-      tz: c[0].tz, // NOTE: tz comes from c.tz (your case)
-    }
+    day: dayStr,
+    tz,
+    record_count: logs.length,
+    day_hash: dayHash,
+    prev_day_hash: prevDayHash,
+    chain_hash: chainHash,
+    hmac,
   };
 }
 
-app.get('/admin/daily', requireAdmin, async (req, res) => {
-  // show last 7 days summary
-  const tz = (req.query.tz || TZ).toString();
-  const today = toDayStrInTZ(new Date(), tz);
+async function verifyDaily(dayStr, tz) {
+  if (!DAILY_HMAC_SECRET) return { error: "DAILY_HMAC_SECRET missing" };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dayStr)) return { error: "invalid day format, use YYYY-MM-DD" };
 
-  try {
-    const rows = await qRows(`
-      SELECT h.day, c.tz, h.record_count, h.day_hash, c.prev_day_hash, c.chain_hash, h.signature
-      FROM daily_hashes h
-      JOIN daily_chains c ON c.day = h.day AND c.tz = h.tz
-      WHERE h.tz = $1
-      ORDER BY h.day DESC
-      LIMIT 14
-    `, [tz]); // IMPORTANT: c.tz is used; NO h.tz column reads except h.tz itself
+  const storedHash = await qRows(
+    `SELECT * FROM daily_hashes WHERE day=$1::date AND tz=$2 LIMIT 1`,
+    [dayStr, tz]
+  );
+  const storedPkg = await qRows(
+    `SELECT * FROM daily_packages WHERE day=$1::date AND tz=$2 LIMIT 1`,
+    [dayStr, tz]
+  );
 
-    const trs = rows.map(r => `
-      <tr>
-        <td>${r.day}</td>
-        <td>${r.record_count}</td>
-        <td style="font-family:ui-monospace,Menlo,Consolas,monospace">${(r.day_hash || '').slice(0,16)}…</td>
-        <td style="font-family:ui-monospace,Menlo,Consolas,monospace">${(r.chain_hash || '').slice(0,16)}…</td>
-        <td>${r.signature ? 'yes' : 'no'}</td>
-        <td>
-          <a href="/admin/daily/build?day=${r.day}&tz=${encodeURIComponent(tz)}">build</a> ·
-          <a href="/admin/daily/verify?day=${r.day}&tz=${encodeURIComponent(tz)}">verify</a> ·
-          <a href="/admin/daily/package?day=${r.day}&tz=${encodeURIComponent(tz)}">package</a>
-        </td>
-      </tr>
-    `).join('');
-
-    const body = `
-      <div class="card">
-        <h1>/admin/daily</h1>
-        <div class="row">
-          <span class="muted">tz=${tz} · today=${today} ·</span>
-          <a class="btn" href="/admin/daily/build?day=${today}&tz=${encodeURIComponent(tz)}">Build Today</a>
-          <a class="btn" href="/admin/logs" style="background:#2b365c">Back to Logs</a>
-        </div>
-        <table>
-          <thead><tr>
-            <th>day</th><th>count</th><th>day_hash</th><th>chain_hash</th><th>signed</th><th>actions</th>
-          </tr></thead>
-          <tbody>${trs || ''}</tbody>
-        </table>
-        <div class="muted" style="margin-top:12px">
-          DAILY_HMAC_SECRET set: <b>${DAILY_HMAC_SECRET ? 'yes' : 'no'}</b>
-        </div>
-      </div>
-    `;
-    return res.send(adminPage('admin daily', body));
-  } catch (e) {
-    console.error('daily page error', e);
-    return res.status(500).send('daily error: ' + e.message);
+  if (!storedHash[0] || !storedPkg[0]) {
+    return { ok: false, error: "no stored daily_hashes/daily_packages for that day" };
   }
-});
 
-app.get('/admin/daily/build', requireAdmin, async (req, res) => {
-  const tz = (req.query.tz || TZ).toString();
-  const day = (req.query.day || toDayStrInTZ(new Date(), tz)).toString();
+  // Recompute day_hash from access_logs
+  const logs = await qRows(
+    `
+    SELECT *
+    FROM access_logs
+    WHERE ((created_at AT TIME ZONE $1)::date = $2::date)
+    ORDER BY created_at ASC, id ASC
+    `,
+    [tz, dayStr]
+  );
 
+  const canonical = logs.map((r) => {
+    const obj = {
+      id: r.id ?? null,
+      created_at: r.created_at ?? null,
+      event: r.event ?? null,
+      phone: r.phone ?? null,
+      first_name: r.first_name ?? null,
+      last_name: r.last_name ?? null,
+      client_mac: r.client_mac ?? null,
+      client_ip: r.client_ip ?? null,
+      marker: r.marker ?? null,
+      kvkk_version: r.kvkk_version ?? null,
+    };
+    return JSON.stringify(obj);
+  });
+
+  const dayPayload = canonical.join("\n");
+  const recomputedDayHash = sha256Hex(dayPayload);
+
+  // Validate package HMAC
+  const pkgJson = storedPkg[0].package_json; // pg returns object
+  const pkgStr = JSON.stringify(pkgJson);
+  const recomputedHmac = hmacSha256Hex(DAILY_HMAC_SECRET, pkgStr);
+
+  const okDayHash = recomputedDayHash === storedHash[0].day_hash;
+  const okHmac = recomputedHmac === storedPkg[0].hmac;
+
+  return {
+    ok: okDayHash && okHmac,
+    day: dayStr,
+    tz,
+    record_count: logs.length,
+    stored_day_hash: storedHash[0].day_hash,
+    recomputed_day_hash: recomputedDayHash,
+    day_hash_match: okDayHash,
+    stored_hmac: storedPkg[0].hmac,
+    recomputed_hmac: recomputedHmac,
+    hmac_match: okHmac,
+  };
+}
+
+// ------------------ Routing ------------------
+async function handle(req, res) {
   try {
-    const out = await buildDaily(day, tz);
-    res.set('Cache-Control', 'no-store');
-    return res.json(out);
+    const urlObj = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const path = urlObj.pathname;
+    const method = req.method || "GET";
+
+    // Health
+    if (path === "/healthz") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // Admin routes
+    if (path.startsWith("/admin")) {
+      if (!requireAdmin(req, res)) return;
+
+      // /admin/logs
+      if (path === "/admin/logs" && method === "GET") {
+        const limit = Math.max(1, Math.min(1000, parseInt(urlObj.searchParams.get("limit") || "200", 10)));
+        const tz = urlObj.searchParams.get("tz") || TZ;
+        const format = (urlObj.searchParams.get("format") || "html").toLowerCase();
+
+        const rows = pool
+          ? await qRows(
+              `
+              SELECT id, created_at, event, first_name, last_name, phone, client_mac, client_ip, marker, kvkk_version
+              FROM access_logs
+              ORDER BY created_at DESC, id DESC
+              LIMIT $1
+              `,
+              [limit]
+            )
+          : [];
+
+        if (format === "json") {
+          res.statusCode = 200;
+          res.setHeader("content-type", "application/json; charset=utf-8");
+          res.end(JSON.stringify(rows));
+          return;
+        }
+
+        res.statusCode = 200;
+        res.setHeader("content-type", "text/html; charset=utf-8");
+        res.end(adminLogsPage(rows, { limit, tz }));
+        return;
+      }
+
+      // /admin/daily/build?day=YYYY-MM-DD
+      if (path === "/admin/daily/build" && method === "GET") {
+        const day = urlObj.searchParams.get("day") || new Date().toISOString().slice(0, 10);
+        const tz = urlObj.searchParams.get("tz") || TZ;
+
+        try {
+          const out = await buildDaily(day, tz);
+          res.statusCode = out.error ? 400 : 200;
+          res.setHeader("content-type", "application/json; charset=utf-8");
+          res.end(JSON.stringify(out, null, 2));
+        } catch (e) {
+          console.error("daily build error", e);
+          res.statusCode = 500;
+          res.setHeader("content-type", "text/plain; charset=utf-8");
+          res.end("daily build error: " + e.message);
+        }
+        return;
+      }
+
+      // /admin/daily/verify?day=YYYY-MM-DD
+      if (path === "/admin/daily/verify" && method === "GET") {
+        const day = urlObj.searchParams.get("day") || new Date().toISOString().slice(0, 10);
+        const tz = urlObj.searchParams.get("tz") || TZ;
+
+        try {
+          const out = await verifyDaily(day, tz);
+          res.statusCode = out.error ? 400 : 200;
+          res.setHeader("content-type", "application/json; charset=utf-8");
+          res.end(JSON.stringify(out, null, 2));
+        } catch (e) {
+          console.error("daily verify error", e);
+          res.statusCode = 500;
+          res.setHeader("content-type", "text/plain; charset=utf-8");
+          res.end("daily verify error: " + e.message);
+        }
+        return;
+      }
+
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    // Splash entry (Meraki lands here)
+    if ((path === "/" || path === "/splash") && method === "GET") {
+      const cookies = parseCookies(req);
+      const marker = cookies.marker || genMarker();
+
+      const ctx = {
+        marker,
+        // Meraki query params (may come as base_grant_url / continue_url / client_mac / client_ip / etc.)
+        base_grant_url:
+          urlObj.searchParams.get("base_grant_url") ||
+          urlObj.searchParams.get("base_grant") ||
+          urlObj.searchParams.get("base_grant_url[]") ||
+          "",
+        continue_url: urlObj.searchParams.get("continue_url") || "",
+        client_mac: urlObj.searchParams.get("client_mac") || "",
+        client_ip: urlObj.searchParams.get("client_ip") || "",
+        gateway_id: urlObj.searchParams.get("gateway_id") || "",
+        node_id: urlObj.searchParams.get("node_id") || "",
+        node_mac: urlObj.searchParams.get("node_mac") || "",
+        ssid: urlObj.searchParams.get("ssid") || "",
+        ap_name: urlObj.searchParams.get("ap_name") || "",
+        user_continue_url: urlObj.searchParams.get("user_continue_url") || "",
+        user_agent: safeStr(req.headers["user-agent"], 300),
+        accept_language: safeStr(req.headers["accept-language"], 120),
+        referrer: safeStr(req.headers["referer"], 300),
+        rawQuery: safeStr(urlObj.search, 600),
+        public_ip: safeStr(req.headers["x-forwarded-for"] || "", 100).split(",")[0].trim(),
+        mode: OTP_MODE,
+      };
+
+      setCookie(res, "marker", marker, { path: "/", httpOnly: true, sameSite: "Lax", maxAge: 7 * 24 * 3600 });
+
+      await logAccess("SPLASH_OPEN", ctx);
+
+      // If OTP already created and mode=screen, show it
+      const existing = otpStore.get(marker);
+      if (existing && existing.exp > nowMs() && OTP_MODE === "screen") {
+        ctx.otp = existing.otp;
+      }
+
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.end(splashPage(ctx));
+      return;
+    }
+
+    // POST /otp/request
+    if (path === "/otp/request" && method === "POST") {
+      const cookies = parseCookies(req);
+      const marker = cookies.marker || genMarker();
+
+      const body = await readBody(req);
+      const form = querystring.parse(body);
+
+      const first_name = safeStr(form.first_name, 60).trim();
+      const last_name = safeStr(form.last_name, 60).trim();
+      const phone = safeStr(form.phone, 30).trim();
+      const kvkkAccepted = form.kvkk === "1";
+
+      // Context from query cookie is limited; store minimal
+      const sess = otpStore.get(marker) || {};
+      const client_mac = sess.client_mac || "";
+      const macKey = `mac:${client_mac || "unknown"}`;
+      const phoneKey = `phone:${phone || "unknown"}`;
+
+      // Rate limits
+      const rlMac = rateHit(macKey, RL_MAC_SECONDS, 5);
+      const rlPhone = rateHit(phoneKey, RL_PHONE_SECONDS, 5);
+      if (!rlMac.ok || !rlPhone.ok) {
+        res.statusCode = 429;
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+        res.end("Rate limit exceeded. Please try again later.");
+        return;
+      }
+
+      const otp = genOtp();
+      const exp = nowMs() + OTP_TTL_SECONDS * 1000;
+
+      otpStore.set(marker, {
+        ...sess,
+        otp,
+        exp,
+        phone,
+        first_name,
+        last_name,
+        wrongCount: 0,
+        lockUntil: 0,
+      });
+
+      console.log("OTP_CREATED", { marker, last4: phone.slice(-4), client_mac: sess.client_mac || "" });
+
+      // Log
+      await logAccess("OTP_CREATED", {
+        marker,
+        phone,
+        first_name,
+        last_name,
+        client_mac: sess.client_mac || null,
+        client_ip: sess.client_ip || null,
+        base_grant_url: sess.base_grant_url || null,
+        continue_url: sess.continue_url || null,
+        kvkk_accepted: kvkkAccepted,
+        kvkk_version: KVKK_VERSION,
+        user_agent: safeStr(req.headers["user-agent"], 300),
+        accept_language: safeStr(req.headers["accept-language"], 120),
+        referrer: safeStr(req.headers["referer"], 300),
+        rawQuery: "",
+        public_ip: safeStr(req.headers["x-forwarded-for"] || "", 100).split(",")[0].trim(),
+        mode: OTP_MODE,
+      });
+
+      if (OTP_MODE === "screen") {
+        console.log("OTP_SCREEN_CODE", { marker, otp });
+      } else {
+        // SMS mode placeholder — you can wire your smsService here if needed
+        console.log("OTP_SMS_MODE: send via SMS provider (not implemented in single-file)");
+      }
+
+      // Redirect back to splash showing OTP if screen mode
+      res.statusCode = 302;
+      res.setHeader("location", "/");
+      res.end();
+      return;
+    }
+
+    // POST /otp/verify
+    if (path === "/otp/verify" && method === "POST") {
+      const cookies = parseCookies(req);
+      const marker = cookies.marker || "";
+
+      const sess = otpStore.get(marker);
+      if (!sess) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+        res.end("Session not found. Please request OTP again.");
+        return;
+      }
+
+      if (sess.lockUntil && nowMs() < sess.lockUntil) {
+        res.statusCode = 403;
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+        res.end("Locked due to too many wrong attempts. Try later.");
+        return;
+      }
+
+      if (sess.exp < nowMs()) {
+        res.statusCode = 400;
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+        res.end("OTP expired. Please request again.");
+        return;
+      }
+
+      const body = await readBody(req);
+      const form = querystring.parse(body);
+      const otp = safeStr(form.otp, 10).trim();
+
+      if (otp !== sess.otp) {
+        sess.wrongCount = (sess.wrongCount || 0) + 1;
+        if (sess.wrongCount >= MAX_WRONG_ATTEMPTS) {
+          sess.lockUntil = nowMs() + LOCK_SECONDS * 1000;
+        }
+        otpStore.set(marker, sess);
+
+        res.statusCode = 401;
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+        res.end("Wrong OTP.");
+        return;
+      }
+
+      console.log("OTP_VERIFY_OK", { marker, client_mac: sess.client_mac || "" });
+
+      await logAccess("OTP_VERIFIED", {
+        marker,
+        phone: sess.phone,
+        first_name: sess.first_name,
+        last_name: sess.last_name,
+        full_name: [sess.first_name, sess.last_name].filter(Boolean).join(" "),
+        client_mac: sess.client_mac || null,
+        client_ip: sess.client_ip || null,
+        base_grant_url: sess.base_grant_url || null,
+        continue_url: sess.continue_url || null,
+        kvkk_accepted: true,
+        kvkk_version: KVKK_VERSION,
+        user_agent: safeStr(req.headers["user-agent"], 300),
+        accept_language: safeStr(req.headers["accept-language"], 120),
+        referrer: safeStr(req.headers["referer"], 300),
+        rawQuery: "",
+        public_ip: safeStr(req.headers["x-forwarded-for"] || "", 100).split(",")[0].trim(),
+        mode: OTP_MODE,
+      });
+
+      // Build grant redirect URL
+      const ctx = {
+        base_grant_url: sess.base_grant_url,
+        continue_url: sess.continue_url,
+        client_mac: sess.client_mac,
+        client_ip: sess.client_ip,
+        gateway_id: sess.gateway_id,
+        node_id: sess.node_id,
+        node_mac: sess.node_mac,
+      };
+      const grantUrl = buildGrantUrl(ctx);
+
+      if (!grantUrl) {
+        res.statusCode = 200;
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+        res.end("OTP verified but base_grant_url missing.");
+        return;
+      }
+
+      console.log("GRANT_CLIENT_REDIRECT:", grantUrl);
+      await logAccess("GRANT_CLIENT_REDIRECT", {
+        marker,
+        phone: sess.phone,
+        first_name: sess.first_name,
+        last_name: sess.last_name,
+        client_mac: sess.client_mac || null,
+        client_ip: sess.client_ip || null,
+        base_grant_url: sess.base_grant_url || null,
+        continue_url: sess.continue_url || null,
+        kvkk_version: KVKK_VERSION,
+        user_agent: safeStr(req.headers["user-agent"], 300),
+        accept_language: safeStr(req.headers["accept-language"], 120),
+        referrer: safeStr(req.headers["referer"], 300),
+        rawQuery: "",
+        public_ip: safeStr(req.headers["x-forwarded-for"] || "", 100).split(",")[0].trim(),
+        mode: OTP_MODE,
+      });
+
+      res.statusCode = 302;
+      res.setHeader("location", grantUrl);
+      res.end();
+      return;
+    }
+
+    // On every request, capture base_grant_url etc into session (so POSTs have them)
+    // (This runs as fallback if not matched earlier)
+    if (method === "GET") {
+      const cookies = parseCookies(req);
+      const marker = cookies.marker || "";
+      if (marker) {
+        const sess = otpStore.get(marker) || {};
+        // Try pick meraki params from current URL too (helps when Meraki calls with /?.... each time)
+        const base_grant_url =
+          urlObj.searchParams.get("base_grant_url") ||
+          urlObj.searchParams.get("base_grant") ||
+          sess.base_grant_url ||
+          "";
+        const continue_url = urlObj.searchParams.get("continue_url") || sess.continue_url || "";
+        const client_mac = urlObj.searchParams.get("client_mac") || sess.client_mac || "";
+        const client_ip = urlObj.searchParams.get("client_ip") || sess.client_ip || "";
+        const gateway_id = urlObj.searchParams.get("gateway_id") || sess.gateway_id || "";
+        const node_id = urlObj.searchParams.get("node_id") || sess.node_id || "";
+        const node_mac = urlObj.searchParams.get("node_mac") || sess.node_mac || "";
+
+        otpStore.set(marker, {
+          ...sess,
+          base_grant_url,
+          continue_url,
+          client_mac,
+          client_ip,
+          gateway_id,
+          node_id,
+          node_mac,
+        });
+      }
+    }
+
+    // Default 404
+    res.statusCode = 404;
+    res.setHeader("content-type", "text/plain; charset=utf-8");
+    res.end("Not found");
   } catch (e) {
-    console.error('daily build error', e);
-    return res.status(500).send('daily build error: ' + e.message);
+    console.error("Unhandled error:", e);
+    res.statusCode = 500;
+    res.setHeader("content-type", "text/plain; charset=utf-8");
+    res.end("Internal error: " + e.message);
   }
-});
+}
 
-app.get('/admin/daily/verify', requireAdmin, async (req, res) => {
-  const tz = (req.query.tz || TZ).toString();
-  const day = (req.query.day || toDayStrInTZ(new Date(), tz)).toString();
-
-  try {
-    const out = await verifyDaily(day, tz);
-    res.set('Cache-Control', 'no-store');
-    return res.json({ day, tz, ...out });
-  } catch (e) {
-    console.error('daily verify error', e);
-    return res.status(500).send('daily verify error: ' + e.message);
-  }
-});
-
-app.get('/admin/daily/package', requireAdmin, async (req, res) => {
-  const tz = (req.query.tz || TZ).toString();
-  const day = (req.query.day || toDayStrInTZ(new Date(), tz)).toString();
-
-  try {
-    const p = await qRows(`SELECT package FROM daily_packages WHERE day=$1::date AND tz=$2 LIMIT 1`, [day, tz]);
-    if (!p[0]) return res.status(404).send('package not found (build first)');
-    res.set('Content-Type', 'application/json; charset=utf-8');
-    return res.send(JSON.stringify(p[0].package, null, 2));
-  } catch (e) {
-    console.error('daily package error', e);
-    return res.status(500).send('daily package error: ' + e.message);
-  }
-});
-
-// -------------------- Health --------------------
-app.get('/healthz', (req, res) => res.status(200).send('ok'));
-
-// -------------------- Startup --------------------
+// ------------------ Start ------------------
 (async () => {
-  try {
-    await q('SELECT 1');
-    console.log('DATABASE: connected');
-    await ensureSchema();
-  } catch (e) {
-    console.error('DB init failed:', e);
-    process.exit(1);
-  }
+  if (pool) await initDb();
 
-  app.listen(PORT, () => {
+  const server = http.createServer(handle);
+  server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
 })();
