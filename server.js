@@ -1,1124 +1,1070 @@
 /**
- * server.js — Meraki Splash + OTP(screen) + KVKK + 5651 log + Admin UI + “imzalama”(hash-chain placeholder)
+ * server.js - Meraki captive portal helper
+ * - OTP_MODE=screen (SMS yok)
+ * - Redis: OTP store (persist)
+ * - Postgres: 5651 access_logs + daily_packages (hash/zincir)
+ * - Admin UI: /admin/logs, /admin/daily (Basic Auth)
  *
- * ✅ DB kolon tipleri: TEXT olacak şekilde tasarlandı (client_ip TEXT)
- * ✅ Admin: /admin/logs  (Basic Auth: ADMIN_USER / ADMIN_PASS)
- * ✅ 5651 için: kayıtlar Postgres’te, zincir hash ile “değiştirilemezlik” kanıtı (placeholder)
+ * ENV required:
+ *  - PORT (Railway)
+ *  - REDIS_URL or REDIS_PUBLIC_URL
+ *  - DATABASE_URL (Postgres)
+ *  - OTP_MODE=screen
+ *  - ADMIN_USER, ADMIN_PASS   (admin endpoints)
  *
- * Railway env (öneri):
- * - PORT=8080 (Railway otomatik)
- * - DATABASE_URL = ${{MerakiPostgres.DATABASE_URL}}
- * - REDIS_URL / REDIS_PUBLIC_URL (opsiyonel)
- * - OTP_MODE=screen
- * - OTP_TTL_SECONDS=180
- * - KVKK_VERSION=2026-02-12-placeholder
- * - ADMIN_USER=...
- * - ADMIN_PASS=...
- * - SIGNING_SECRET=... (uzun random)
+ * Optional:
+ *  - OTP_TTL_SECONDS (default 180)
+ *  - RL_MAC_SECONDS (default 30)
+ *  - RL_PHONE_SECONDS (default 60)
+ *  - MAX_WRONG_ATTEMPTS (default 5)
+ *  - LOCK_SECONDS (default 600)
+ *  - KVKK_VERSION (default 'placeholder')
+ *  - TZ (default 'Europe/Istanbul')
  */
+
+"use strict";
 
 const express = require("express");
 const crypto = require("crypto");
 const { Pool } = require("pg");
+const { createClient } = require("redis");
 
-let Redis = null;
-let redis = null;
-try {
-  Redis = require("ioredis");
-} catch (_) {
-  // ignore
-}
-
-// -------------------- ENV --------------------
-const PORT = Number(process.env.PORT || 8080);
-const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen | sms (sms'i sonra)
-const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 180);
-
-const KVKK_VERSION = process.env.KVKK_VERSION || "placeholder";
-const ADMIN_USER = process.env.ADMIN_USER || "";
-const ADMIN_PASS = process.env.ADMIN_PASS || "";
-const SIGNING_SECRET = process.env.SIGNING_SECRET || "CHANGE_ME_SIGNING_SECRET";
-
-const RL_MAC_SECONDS = Number(process.env.RL_MAC_SECONDS || 30);
-const RL_PHONE_SECONDS = Number(process.env.RL_PHONE_SECONDS || 60);
-const MAX_WRONG_ATTEMPTS = Number(process.env.MAX_WRONG_ATTEMPTS || 5);
-const LOCK_SECONDS = Number(process.env.LOCK_SECONDS || 600);
-
-// DB
-const DATABASE_URL = process.env.DATABASE_URL || "";
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
-
-// Redis
-const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || "";
-if (Redis && REDIS_URL) {
-  redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2, enableReadyCheck: true });
-}
-
-function log(...args) {
-  console.log(...args);
-}
-
-// -------------------- APP --------------------
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// -------------------- HELPERS --------------------
+// -------------------- ENV --------------------
+const PORT = parseInt(process.env.PORT || "8080", 10);
+
+const OTP_MODE = (process.env.OTP_MODE || "screen").trim();
+const OTP_TTL_SECONDS = parseInt(process.env.OTP_TTL_SECONDS || "180", 10);
+const RL_MAC_SECONDS = parseInt(process.env.RL_MAC_SECONDS || "30", 10);
+const RL_PHONE_SECONDS = parseInt(process.env.RL_PHONE_SECONDS || "60", 10);
+const MAX_WRONG_ATTEMPTS = parseInt(process.env.MAX_WRONG_ATTEMPTS || "5", 10);
+const LOCK_SECONDS = parseInt(process.env.LOCK_SECONDS || "600", 10);
+
+const KVKK_VERSION = (process.env.KVKK_VERSION || "placeholder").trim();
+const TZ = (process.env.TZ || "Europe/Istanbul").trim();
+
+const ADMIN_USER = (process.env.ADMIN_USER || "").trim();
+const ADMIN_PASS = (process.env.ADMIN_PASS || "").trim();
+
+const REDIS_URL = (process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || "").trim();
+const DATABASE_URL = (process.env.DATABASE_URL || "").trim();
+
+console.log("ENV:", {
+  OTP_MODE,
+  OTP_TTL_SECONDS,
+  RL_MAC_SECONDS,
+  RL_PHONE_SECONDS,
+  MAX_WRONG_ATTEMPTS,
+  LOCK_SECONDS,
+  KVKK_VERSION,
+  TZ,
+  ADMIN_USER_SET: !!ADMIN_USER,
+  ADMIN_PASS_SET: !!ADMIN_PASS,
+});
+
+// -------------------- Helpers --------------------
 function nowIso() {
   return new Date().toISOString();
 }
 
-function safeText(v) {
-  if (v === undefined || v === null) return null;
-  const s = String(v).trim();
-  return s.length ? s : null;
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(s, "utf8").digest("hex");
 }
 
-function normalizePhone(raw) {
-  const s = (raw || "").toString().trim();
-  if (!s) return null;
-  // sadece rakam ve + kalsın
-  let t = s.replace(/[^\d+]/g, "");
-  // 0xxxxxxxxxx => +90xxxxxxxxxx
-  if (/^0\d{10}$/.test(t)) t = "+9" + t; // 0 -> +90 (0xxxxxxxxxx => +90xxxxxxxxxx)
-  if (/^\+?90\d{10}$/.test(t) && !t.startsWith("+")) t = "+" + t;
-  return t;
+// JSON canonicalize (stable)
+function stableStringify(obj) {
+  if (obj === null || obj === undefined) return "null";
+  if (typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return "[" + obj.map(stableStringify).join(",") + "]";
+  const keys = Object.keys(obj).sort();
+  return "{" + keys.map(k => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",") + "}";
 }
 
-function getPublicIp(req) {
-  // Railway/Proxy arkasında: x-forwarded-for
+function isYmd(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function safeText(x, max = 2000) {
+  if (x === undefined || x === null) return null;
+  const s = String(x);
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function normalizePhone(input) {
+  if (!input) return "";
+  let s = String(input).trim();
+  // keep + and digits
+  s = s.replace(/[^\d+]/g, "");
+  // allow starting 0 or +90...
+  return s;
+}
+
+function normalizeMac(input) {
+  if (!input) return "";
+  return String(input).trim().toLowerCase();
+}
+
+function getReqPublicIp(req) {
+  // Prefer x-forwarded-for (Railway uses proxies)
   const xf = req.headers["x-forwarded-for"];
   if (xf) return String(xf).split(",")[0].trim();
-  return req.socket?.remoteAddress || null;
+  const xr = req.headers["x-real-ip"];
+  if (xr) return String(xr).trim();
+  return (req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress) : "";
 }
 
-function basicAuth(req, res, next) {
+function basicAuthHeader(user, pass) {
+  const token = Buffer.from(`${user}:${pass}`).toString("base64");
+  return `Basic ${token}`;
+}
+
+function requireAdmin(req, res, next) {
   if (!ADMIN_USER || !ADMIN_PASS) {
-    return res.status(500).send("Admin credentials are not set (ADMIN_USER/ADMIN_PASS).");
+    return res.status(503).send("admin credentials not configured");
   }
-  const h = req.headers.authorization || "";
-  if (!h.startsWith("Basic ")) {
-    res.set("WWW-Authenticate", 'Basic realm="admin"');
-    return res.status(401).send("Auth required");
+  const hdr = req.headers["authorization"] || "";
+  if (!hdr.startsWith("Basic ")) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
+    return res.status(401).send("auth required");
   }
-  const decoded = Buffer.from(h.slice(6), "base64").toString("utf8");
-  const [u, p] = decoded.split(":");
-  if (u === ADMIN_USER && p === ADMIN_PASS) return next();
-  res.set("WWW-Authenticate", 'Basic realm="admin"');
-  return res.status(401).send("Invalid credentials");
+  try {
+    const raw = Buffer.from(hdr.slice(6), "base64").toString("utf8");
+    const [u, p] = raw.split(":");
+    if (u === ADMIN_USER && p === ADMIN_PASS) return next();
+  } catch (_) {}
+  res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
+  return res.status(401).send("invalid credentials");
 }
 
-function hmacHex(secret, data) {
-  return crypto.createHmac("sha256", secret).update(data, "utf8").digest("hex");
-}
+// -------------------- Redis --------------------
+let redis = null;
+let redisEnabled = false;
 
-function canonicalRowForHash(row) {
-  // Stabil, sıralı, JSONB de stabil stringify
-  const stableMeta = row.meta ? JSON.stringify(row.meta) : "";
-  return [
-    row.created_at || "",
-    row.event || "",
-    row.first_name || "",
-    row.last_name || "",
-    row.phone || "",
-    String(row.kvkk_accepted ?? ""),
-    row.kvkk_version || "",
-    row.client_mac || "",
-    row.client_ip || "",
-    row.ssid || "",
-    row.ap_name || "",
-    row.base_grant_url || "",
-    row.continue_url || "",
-    row.node_mac || "",
-    row.node_id || "",
-    row.gateway_id || "",
-    row.public_ip || "",
-    row.user_agent || "",
-    stableMeta,
-    row.prev_hash || "",
-  ].join("|");
-}
-
-// -------------------- DB INIT --------------------
-async function dbInit() {
-  if (!pool) {
-    log("DATABASE: not configured (DATABASE_URL missing).");
+async function initRedis() {
+  if (!REDIS_URL) {
+    console.log("REDIS: not configured (REDIS_URL / REDIS_PUBLIC_URL missing).");
     return;
   }
+  redis = createClient({ url: REDIS_URL });
+  redis.on("error", (err) => console.error("REDIS_ERROR", err));
+  await redis.connect();
+  redisEnabled = true;
+  console.log("REDIS: connected");
+}
+
+function rKeyOtp(marker) { return `otp:${marker}`; }
+function rKeyRlMac(mac) { return `rl:mac:${mac}`; }
+function rKeyRlPhone(phone) { return `rl:phone:${phone}`; }
+function rKeyLockMac(mac) { return `lock:mac:${mac}`; }
+
+// -------------------- Postgres --------------------
+let pool = null;
+let dbEnabled = false;
+
+async function initDb() {
+  if (!DATABASE_URL) {
+    console.log("DATABASE: not configured (DATABASE_URL missing).");
+    return;
+  }
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+  });
+  await pool.query("SELECT 1");
+  dbEnabled = true;
+  console.log("DATABASE: connected");
+
+  // access_logs table (client_ip TEXT per your note)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_logs (
-      id BIGSERIAL PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      id bigserial PRIMARY KEY,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      event text NOT NULL,
 
-      event TEXT NOT NULL,
+      first_name text,
+      last_name text,
+      phone text,
 
-      first_name TEXT,
-      last_name TEXT,
-      phone TEXT,
+      client_mac text,
+      client_ip text,
 
-      kvkk_accepted BOOLEAN NOT NULL DEFAULT false,
-      kvkk_version TEXT,
+      ssid text,
+      ap_name text,
 
-      client_mac TEXT,
-      client_ip TEXT,
+      base_grant_url text,
+      continue_url text,
 
-      ssid TEXT,
-      ap_name TEXT,
+      marker text,
 
-      base_grant_url TEXT,
-      continue_url TEXT,
+      kvkk_accepted boolean,
+      kvkk_version text,
 
-      node_mac TEXT,
-      node_id TEXT,
-      gateway_id TEXT,
-
-      public_ip TEXT,
-      user_agent TEXT,
-
-      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-
-      prev_hash TEXT,
-      row_hash TEXT
+      meta jsonb
     );
   `);
 
-  // indexler (rapor/sorgu)
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at DESC);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_phone ON access_logs(phone);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_mac ON access_logs(client_mac);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_ip ON access_logs(client_ip);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_event ON access_logs(event);`);
+  // daily_packages table (5651 daily chain)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_packages (
+      day date PRIMARY KEY,
+      tz text NOT NULL DEFAULT 'Europe/Istanbul',
+      record_count integer NOT NULL,
+      body_json jsonb NOT NULL,
+      day_hash text NOT NULL,
+      prev_day_hash text,
+      chain_hash text NOT NULL,
+      signature_type text,
+      signature text,
+      signed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+  `);
 
-  log("DATABASE: connected");
-  log("DATABASE: table ready");
+  console.log("DATABASE: table ready");
 }
 
-// -------------------- OTP STORE (Redis or Memory fallback) --------------------
-const memOtp = new Map(); // key -> {otp, exp, wrong, lockedUntil, payload}
-const memRate = new Map(); // key -> {count, resetAt}
-
-function rateKeyMac(mac) { return `rl:mac:${mac || "unknown"}`; }
-function rateKeyPhone(phone) { return `rl:ph:${phone || "unknown"}`; }
-
-function rateAllow(key, windowSeconds) {
-  const now = Date.now();
-  const item = memRate.get(key);
-  if (!item || item.resetAt <= now) {
-    memRate.set(key, { count: 1, resetAt: now + windowSeconds * 1000 });
-    return true;
-  }
-  if (item.count >= 20) return false; // basit limit
-  item.count += 1;
-  return true;
+async function qRows(sql, params = []) {
+  if (!dbEnabled) return [];
+  const r = await pool.query(sql, params);
+  return r.rows || [];
 }
 
-async function otpSet(marker, obj) {
-  const key = `otp:${marker}`;
-  const payload = JSON.stringify(obj);
-  if (redis) {
-    await redis.set(key, payload, "EX", OTP_TTL_SECONDS);
-    return;
-  }
-  memOtp.set(key, obj);
-  setTimeout(() => memOtp.delete(key), OTP_TTL_SECONDS * 1000).unref?.();
-}
+async function logDb(event, payload) {
+  if (!dbEnabled) return;
 
-async function otpGet(marker) {
-  const key = `otp:${marker}`;
-  if (redis) {
-    const v = await redis.get(key);
-    return v ? JSON.parse(v) : null;
-  }
-  return memOtp.get(key) || null;
-}
-
-async function otpDel(marker) {
-  const key = `otp:${marker}`;
-  if (redis) {
-    await redis.del(key);
-    return;
-  }
-  memOtp.delete(key);
-}
-
-// -------------------- LOG INSERT (hash-chain) --------------------
-async function getLastRowHash() {
-  if (!pool) return null;
-  const r = await pool.query(`SELECT row_hash FROM access_logs ORDER BY id DESC LIMIT 1;`);
-  return r.rows?.[0]?.row_hash || null;
-}
-
-async function insertLog(row) {
-  if (!pool) return;
-
-  // prev_hash zinciri
-  const prev_hash = await getLastRowHash();
-  row.prev_hash = prev_hash || null;
-
-  // created_at DB default: now(), ama hash için “yakın” zaman sabitleyelim
-  row.created_at = nowIso();
-
-  // row_hash üret
-  const canon = canonicalRowForHash(row);
-  row.row_hash = hmacHex(SIGNING_SECRET, canon);
-
-  const q = `
+  // columns expected in payload:
+  // first_name,last_name,phone,client_mac,client_ip,ssid,ap_name,base_grant_url,continue_url,marker,kvkk_accepted,kvkk_version,meta
+  const p = payload || {};
+  const client_ip = p.client_ip ? String(p.client_ip) : null; // TEXT
+  const sql = `
     INSERT INTO access_logs(
-      created_at, event,
-      first_name, last_name, phone,
-      kvkk_accepted, kvkk_version,
-      client_mac, client_ip,
-      ssid, ap_name,
-      base_grant_url, continue_url,
-      node_mac, node_id, gateway_id,
-      public_ip, user_agent,
-      meta,
-      prev_hash, row_hash
+      event, client_mac, client_ip, ssid, ap_name,
+      base_grant_url, continue_url, marker,
+      phone, first_name, last_name,
+      kvkk_accepted, kvkk_version, meta
     )
-    VALUES(
-      $1::timestamptz, $2,
-      $3, $4, $5,
-      $6::boolean, $7,
-      $8, $9,
-      $10, $11,
-      $12, $13,
-      $14, $15, $16,
-      $17, $18,
-      $19::jsonb,
-      $20, $21
-    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
   `;
-
   const vals = [
-    row.created_at,
-    row.event,
-
-    row.first_name,
-    row.last_name,
-    row.phone,
-
-    !!row.kvkk_accepted,
-    row.kvkk_version,
-
-    row.client_mac,
-    row.client_ip,
-
-    row.ssid,
-    row.ap_name,
-
-    row.base_grant_url,
-    row.continue_url,
-
-    row.node_mac,
-    row.node_id,
-    row.gateway_id,
-
-    row.public_ip,
-    row.user_agent,
-
-    JSON.stringify(row.meta || {}),
-
-    row.prev_hash,
-    row.row_hash,
+    event,
+    p.client_mac ? safeText(p.client_mac, 128) : null,
+    client_ip ? safeText(client_ip, 128) : null,
+    p.ssid ? safeText(p.ssid, 128) : null,
+    p.ap_name ? safeText(p.ap_name, 128) : null,
+    p.base_grant_url ? safeText(p.base_grant_url, 2000) : null,
+    p.continue_url ? safeText(p.continue_url, 2000) : null,
+    p.marker ? safeText(p.marker, 64) : null,
+    p.phone ? safeText(p.phone, 64) : null,
+    p.first_name ? safeText(p.first_name, 128) : null,
+    p.last_name ? safeText(p.last_name, 128) : null,
+    (p.kvkk_accepted === undefined ? null : !!p.kvkk_accepted),
+    p.kvkk_version ? safeText(p.kvkk_version, 64) : null,
+    JSON.stringify(p.meta || null),
   ];
 
-  await pool.query(q, vals);
+  try {
+    await pool.query(sql, vals);
+  } catch (e) {
+    console.error("DB LOG ERROR:", e.message);
+  }
 }
 
-// -------------------- MERAKI PARAMS --------------------
-function extractMerakiParams(req) {
-  // Meraki query param isimleri farklı gelebilir; bu set iş görüyor
+// -------------------- Meraki param parsing --------------------
+function parseMerakiParams(req) {
+  // Meraki sends gateway_id, node_id, client_ip, client_mac, node_mac, continue_url, etc.
+  // In some flows, base_grant_url is present.
   const q = req.query || {};
-  const base_grant_url = safeText(q.base_grant_url || q.baseGrantUrl || q.grant_url);
-  const continue_url = safeText(q.continue_url || q.user_continue_url || q.continue || q.redirect);
 
-  const client_mac = safeText(q.client_mac || q.clientMac);
-  const client_ip = safeText(q.client_ip || q.clientIp);
-  const node_mac = safeText(q.node_mac || q.nodeMac);
-  const node_id = safeText(q.node_id || q.nodeId);
-  const gateway_id = safeText(q.gateway_id || q.gatewayId);
-  const ssid = safeText(q.ssid);
-  const ap_name = safeText(q.ap_name || q.apName);
+  const base_grant_url = q.base_grant_url ? String(q.base_grant_url) : "";
+  const continue_url = q.continue_url ? String(q.continue_url) : "";
+
+  const gateway_id = q.gateway_id ? String(q.gateway_id) : "";
+  const node_id = q.node_id ? String(q.node_id) : "";
+  const client_ip = q.client_ip ? String(q.client_ip) : "";
+  const client_mac = q.client_mac ? String(q.client_mac) : "";
+  const node_mac = q.node_mac ? String(q.node_mac) : "";
+
+  // optional
+  const ssid = q.ssid ? String(q.ssid) : "";
+  const ap_name = q.ap_name ? String(q.ap_name) : "";
+
+  const hasBaseGrant = !!base_grant_url;
+  const hasContinue = !!continue_url;
+  const hasClientMac = !!client_mac;
 
   return {
     base_grant_url,
     continue_url,
-    client_mac,
-    client_ip,
-    node_mac,
-    node_id,
     gateway_id,
+    node_id,
+    client_ip,
+    client_mac,
+    node_mac,
     ssid,
     ap_name,
+    hasBaseGrant,
+    hasContinue,
+    hasClientMac,
   };
 }
 
-function buildGrantRedirectUrl(params) {
-  // En sağlıklısı: base_grant_url’yi redirect etmek, gerekli query'leri (continue_url/duration) eklemek
-  // base_grant_url örnek: https://eu.network-auth.com/splash/XXXXX/grant
-  if (!params.base_grant_url) return null;
+// Build grant URL for client redirect (Meraki expects browser redirect)
+function buildGrantClientRedirect(params) {
+  // Best practice: redirect client to base_grant_url with required params.
+  // If base_grant_url already includes '?' keep it simple; else add query.
+  // We'll attach required fields if present.
+  const base = params.base_grant_url;
+  if (!base) return "";
 
-  const u = new URL(params.base_grant_url);
-  // Meraki bazen gerekli alanları base_grant_url içinde taşır; biz ek olarak güvenli şekilde ekleyelim
-  if (params.gateway_id) u.searchParams.set("gateway_id", params.gateway_id);
-  if (params.node_id) u.searchParams.set("node_id", params.node_id);
-  if (params.client_ip) u.searchParams.set("client_ip", params.client_ip);
-  if (params.client_mac) u.searchParams.set("client_mac", params.client_mac);
-  if (params.node_mac) u.searchParams.set("node_mac", params.node_mac);
-  if (params.continue_url) u.searchParams.set("continue_url", params.continue_url);
+  const url = new URL(base);
+  // Meraki required fields often: gateway_id, node_id, client_ip, client_mac, node_mac, continue_url
+  if (params.gateway_id) url.searchParams.set("gateway_id", params.gateway_id);
+  if (params.node_id) url.searchParams.set("node_id", params.node_id);
+  if (params.client_ip) url.searchParams.set("client_ip", params.client_ip);
+  if (params.client_mac) url.searchParams.set("client_mac", params.client_mac);
+  if (params.node_mac) url.searchParams.set("node_mac", params.node_mac);
 
-  // süre (opsiyonel)
-  u.searchParams.set("duration", "3600");
-  return u.toString();
+  // include continue_url to keep flow smooth
+  if (params.continue_url) url.searchParams.set("continue_url", params.continue_url);
+
+  return url.toString();
 }
 
-// -------------------- UI (SPLASH) --------------------
-function splashHtml(ctx) {
-  // KVKK placeholder
-  const kvkkText = `
-    <div class="kvkk-box">
-      <h3>KVKK Aydınlatma Metni (Placeholder)</h3>
-      <p>Buraya firmanızın KVKK aydınlatma metni HTML olarak eklenecek.</p>
-      <p><b>Versiyon:</b> ${ctx.kvkkVersion}</p>
+// -------------------- OTP & Rate-limit --------------------
+function makeMarker() {
+  // 6-digit marker
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function isLocked(mac) {
+  if (!redisEnabled) return false;
+  const v = await redis.get(rKeyLockMac(mac));
+  return !!v;
+}
+
+async function lockMac(mac, reason = "too_many_wrong") {
+  if (!redisEnabled) return;
+  await redis.set(rKeyLockMac(mac), reason, { EX: LOCK_SECONDS });
+}
+
+async function rateLimitByMac(mac) {
+  if (!redisEnabled) return true;
+  const key = rKeyRlMac(mac);
+  const n = await redis.incr(key);
+  if (n === 1) await redis.expire(key, RL_MAC_SECONDS);
+  return n <= 5; // basic burst
+}
+
+async function rateLimitByPhone(phone) {
+  if (!redisEnabled) return true;
+  const key = rKeyRlPhone(phone);
+  const n = await redis.incr(key);
+  if (n === 1) await redis.expire(key, RL_PHONE_SECONDS);
+  return n <= 5;
+}
+
+async function otpCreate({ phone, client_mac, meta }) {
+  const marker = makeMarker();
+  const otp = makeMarker(); // 6-digit OTP
+  const data = {
+    marker,
+    otp,
+    created_at: nowIso(),
+    phone,
+    client_mac,
+    wrong: 0,
+    meta: meta || null,
+  };
+  if (redisEnabled) {
+    await redis.set(rKeyOtp(marker), JSON.stringify(data), { EX: OTP_TTL_SECONDS });
+  }
+  return { marker, otp };
+}
+
+async function otpGet(marker) {
+  if (!redisEnabled) return null;
+  const v = await redis.get(rKeyOtp(marker));
+  if (!v) return null;
+  try { return JSON.parse(v); } catch { return null; }
+}
+
+async function otpBumpWrong(marker) {
+  if (!redisEnabled) return null;
+  const d = await otpGet(marker);
+  if (!d) return null;
+  d.wrong = (d.wrong || 0) + 1;
+  // Keep remaining TTL: easiest set again with full TTL is OK for now (or you can keep TTL via TTL command)
+  await redis.set(rKeyOtp(marker), JSON.stringify(d), { EX: OTP_TTL_SECONDS });
+  return d;
+}
+
+async function otpConsume(marker) {
+  if (!redisEnabled) return;
+  await redis.del(rKeyOtp(marker));
+}
+
+// -------------------- Daily packages (5651) --------------------
+async function fetchAccessLogsForDay(dayYmd, tz = TZ) {
+  const sql = `
+    SELECT
+      id,
+      created_at,
+      event,
+      first_name,
+      last_name,
+      phone,
+      client_mac,
+      client_ip,
+      ssid,
+      ap_name,
+      base_grant_url,
+      continue_url,
+      marker,
+      kvkk_accepted,
+      kvkk_version,
+      meta
+    FROM access_logs
+    WHERE created_at >= ((($1::date)::timestamp) AT TIME ZONE $2)
+      AND created_at <  (((($1::date + 1))::timestamp) AT TIME ZONE $2)
+    ORDER BY created_at ASC, id ASC
+  `;
+  return await qRows(sql, [dayYmd, tz]);
+}
+
+async function buildDailyPackage(dayYmd, tz = TZ) {
+  if (!dbEnabled) throw new Error("db disabled");
+  if (!isYmd(dayYmd)) throw new Error("bad day format");
+
+  const rows = await fetchAccessLogsForDay(dayYmd, tz);
+
+  const body = {
+    day: dayYmd,
+    tz,
+    generated_at: nowIso(),
+    record_count: rows.length,
+    records: rows.map(x => ({
+      id: x.id,
+      created_at: x.created_at,
+      event: x.event,
+      first_name: x.first_name,
+      last_name: x.last_name,
+      phone: x.phone,
+      client_mac: x.client_mac,
+      client_ip: x.client_ip,
+      ssid: x.ssid,
+      ap_name: x.ap_name,
+      base_grant_url: x.base_grant_url,
+      continue_url: x.continue_url,
+      marker: x.marker,
+      kvkk_accepted: x.kvkk_accepted,
+      kvkk_version: x.kvkk_version,
+      meta: x.meta || null,
+    })),
+  };
+
+  const canonical = stableStringify(body);
+  const day_hash = sha256Hex(canonical);
+
+  const prev = await qRows(
+    `SELECT day, day_hash, chain_hash FROM daily_packages WHERE day < $1::date ORDER BY day DESC LIMIT 1`,
+    [dayYmd]
+  );
+  const prev_day_hash = prev.length ? prev[0].day_hash : null;
+  const prev_chain_hash = prev.length ? prev[0].chain_hash : "GENESIS";
+  const chain_hash = sha256Hex(prev_chain_hash + "\n" + day_hash);
+
+  await pool.query(
+    `
+    INSERT INTO daily_packages(day, tz, record_count, body_json, day_hash, prev_day_hash, chain_hash, updated_at)
+    VALUES ($1::date, $2, $3, $4::jsonb, $5, $6, $7, now())
+    ON CONFLICT (day)
+    DO UPDATE SET
+      tz = EXCLUDED.tz,
+      record_count = EXCLUDED.record_count,
+      body_json = EXCLUDED.body_json,
+      day_hash = EXCLUDED.day_hash,
+      prev_day_hash = EXCLUDED.prev_day_hash,
+      chain_hash = EXCLUDED.chain_hash,
+      updated_at = now()
+    `,
+    [dayYmd, tz, rows.length, JSON.stringify(body), day_hash, prev_day_hash, chain_hash]
+  );
+
+  return { day: dayYmd, tz, record_count: rows.length, day_hash, prev_day_hash, chain_hash };
+}
+
+async function verifyDailyPackage(dayYmd) {
+  if (!dbEnabled) throw new Error("db disabled");
+  if (!isYmd(dayYmd)) throw new Error("bad day format");
+
+  const r = await qRows(`SELECT * FROM daily_packages WHERE day = $1::date`, [dayYmd]);
+  if (!r.length) return { ok: false, reason: "not_found" };
+
+  const pkg = r[0];
+  const canonical = stableStringify(pkg.body_json);
+  const computed_day_hash = sha256Hex(canonical);
+
+  const prev = await qRows(`SELECT chain_hash FROM daily_packages WHERE day < $1::date ORDER BY day DESC LIMIT 1`, [dayYmd]);
+  const prev_chain_hash = prev.length ? prev[0].chain_hash : "GENESIS";
+  const computed_chain_hash = sha256Hex(prev_chain_hash + "\n" + computed_day_hash);
+
+  const ok = (computed_day_hash === pkg.day_hash) && (computed_chain_hash === pkg.chain_hash);
+  return {
+    ok,
+    stored: { day_hash: pkg.day_hash, chain_hash: pkg.chain_hash },
+    computed: { day_hash: computed_day_hash, chain_hash: computed_chain_hash },
+  };
+}
+
+// -------------------- UI (KVKK placeholder + OTP screen) --------------------
+function renderSplashForm(params, opts = {}) {
+  const { error = "", marker = "", phone = "", first_name = "", last_name = "", kvkkAccepted = false } = opts;
+
+  // simple modern UI
+  const logo = `
+    <div style="display:flex;justify-content:center;margin-bottom:14px;">
+      <div style="width:56px;height:56px;border-radius:16px;background:#1a1a2e;display:flex;align-items:center;justify-content:center;border:1px solid #2b2b4a;">
+        <div style="width:26px;height:26px;border-radius:50%;background:#9dd1ff;opacity:.9"></div>
+      </div>
     </div>
   `;
 
-  // Hidden fields: meraki params + marker
-  const hidden = Object.entries(ctx.hidden || {})
-    .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || "").replace(/"/g, "&quot;")}" />`)
-    .join("\n");
+  const kvkkHtml = `
+    <div style="max-height:140px;overflow:auto;border:1px solid #2b2b4a;border-radius:10px;padding:10px;background:#0f0f1f;font-size:12px;opacity:.9">
+      <b>KVKK Aydınlatma Metni (Placeholder)</b><br/>
+      Bu metin daha sonra gerçek KVKK metni ile değiştirilecektir. Kullanıcıdan açık rıza/onay alınır.
+    </div>
+  `;
+
+  // keep original meraki query string
+  const qs = new URLSearchParams(params.rawQuery || {}).toString();
 
   return `<!doctype html>
-<html lang="tr">
+<html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Misafir Wi-Fi Giriş</title>
+  <title>Guest WiFi</title>
   <style>
-    :root{--bg:#0b0f1a;--card:#121a2a;--text:#eaf0ff;--muted:#a7b3d6;--accent:#6e5cff;--danger:#ff4d4d;}
-    body{margin:0;background:radial-gradient(1200px 800px at 70% 10%, #1a2450 0%, var(--bg) 55%);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
-    .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
-    .card{width:min(520px,100%);background:rgba(18,26,42,.92);border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,.35);overflow:hidden}
-    .head{padding:22px 22px 10px;display:flex;gap:14px;align-items:center}
-    .logo{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#20e3b2);display:flex;align-items:center;justify-content:center;font-weight:800;color:#0b0f1a}
-    .title{font-size:18px;font-weight:800;line-height:1.2}
-    .sub{color:var(--muted);font-size:13px;margin-top:3px}
-    .content{padding:0 22px 22px}
-    label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
-    input[type="text"], input[type="tel"]{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);outline:none}
-    input:focus{border-color:rgba(110,92,255,.65);box-shadow:0 0 0 4px rgba(110,92,255,.18)}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    .kvkk{margin-top:12px;display:flex;gap:10px;align-items:flex-start}
-    .kvkk input{margin-top:4px}
-    .kvkk small{color:var(--muted);display:block;margin-top:6px}
-    .kvkk-box{margin-top:10px;padding:12px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08)}
-    .kvkk-box h3{margin:0 0 6px;font-size:13px}
-    .kvkk-box p{margin:6px 0;color:var(--muted);font-size:12px;line-height:1.35}
-    .actions{margin-top:16px;display:flex;gap:10px}
-    button{flex:1;padding:12px;border-radius:12px;border:none;background:linear-gradient(135deg,var(--accent),#20e3b2);color:#0b0f1a;font-weight:900;cursor:pointer}
-    .ghost{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text)}
-    .err{margin-top:12px;color:var(--danger);font-size:13px}
-    .meta{margin-top:12px;color:rgba(167,179,214,.8);font-size:11px}
-    .chip{display:inline-block;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);margin-right:6px}
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <div class="head">
-      <div class="logo">Wi</div>
-      <div>
-        <div class="title">Misafir İnternet Girişi</div>
-        <div class="sub">Ad-Soyad, telefon ve KVKK onayı ile giriş.</div>
-      </div>
-    </div>
-    <div class="content">
-      ${ctx.error ? `<div class="err">${ctx.error}</div>` : ""}
-      <form method="POST" action="/otp/create">
-        ${hidden}
-        <div class="row">
-          <div>
-            <label>Ad</label>
-            <input name="first_name" type="text" required maxlength="80" placeholder="Ad" />
-          </div>
-          <div>
-            <label>Soyad</label>
-            <input name="last_name" type="text" required maxlength="80" placeholder="Soyad" />
-          </div>
-        </div>
-
-        <label>Cep Telefonu</label>
-        <input name="phone" type="tel" required maxlength="20" placeholder="0 5xx xxx xx xx" />
-
-        <div class="kvkk">
-          <input type="checkbox" name="kvkk_accepted" value="true" required />
-          <div>
-            <div><b>KVKK Aydınlatma Metni</b> ve <b>Açık Rıza</b> koşullarını okudum, kabul ediyorum.</div>
-            <small>Bu metin daha sonra gerçek içerikle değiştirilecek.</small>
-          </div>
-        </div>
-
-        ${kvkkText}
-
-        <div class="actions">
-          <button type="submit">Devam Et</button>
-          <button type="button" class="ghost" onclick="location.reload()">Yenile</button>
-        </div>
-
-        <div class="meta">
-          <span class="chip">OTP: ${OTP_MODE}</span>
-          <span class="chip">KVKK: ${ctx.kvkkVersion}</span>
-        </div>
-      </form>
-    </div>
-  </div>
-</div>
-</body>
-</html>`;
-}
-
-function otpHtml(ctx) {
-  const hidden = Object.entries(ctx.hidden || {})
-    .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || "").replace(/"/g, "&quot;")}" />`)
-    .join("\n");
-
-  return `<!doctype html>
-<html lang="tr">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>OTP Doğrulama</title>
-  <style>
-    :root{--bg:#0b0f1a;--card:#121a2a;--text:#eaf0ff;--muted:#a7b3d6;--accent:#6e5cff;--danger:#ff4d4d;}
-    body{margin:0;background:radial-gradient(1200px 800px at 70% 10%, #1a2450 0%, var(--bg) 55%);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
-    .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
-    .card{width:min(520px,100%);background:rgba(18,26,42,.92);border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,.35);overflow:hidden}
-    .head{padding:22px 22px 10px}
-    .title{font-size:18px;font-weight:900}
-    .sub{color:var(--muted);font-size:13px;margin-top:4px}
-    .content{padding:0 22px 22px}
-    label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
-    input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);outline:none}
-    input:focus{border-color:rgba(110,92,255,.65);box-shadow:0 0 0 4px rgba(110,92,255,.18)}
-    .actions{margin-top:16px;display:flex;gap:10px}
-    button{flex:1;padding:12px;border-radius:12px;border:none;background:linear-gradient(135deg,var(--accent),#20e3b2);color:#0b0f1a;font-weight:900;cursor:pointer}
-    .ghost{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text)}
-    .err{margin-top:12px;color:var(--danger);font-size:13px}
-    .codebox{margin-top:10px;padding:12px;border-radius:12px;background:rgba(255,255,255,.03);border:1px dashed rgba(255,255,255,.2);color:var(--muted);font-size:12px}
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <div class="head">
-      <div class="title">Doğrulama Kodu</div>
-      <div class="sub">Telefonuna gelen kodu gir (şimdilik ekranda gösteriyoruz).</div>
-    </div>
-    <div class="content">
-      ${ctx.error ? `<div class="err">${ctx.error}</div>` : ""}
-      ${ctx.debugCode ? `<div class="codebox"><b>DEBUG (screen mode):</b> Kod = <b>${ctx.debugCode}</b></div>` : ""}
-      <form method="POST" action="/otp/verify">
-        ${hidden}
-        <label>OTP</label>
-        <input name="otp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required placeholder="6 haneli kod" />
-        <div class="actions">
-          <button type="submit">Bağlan</button>
-          <button type="button" class="ghost" onclick="history.back()">Geri</button>
-        </div>
-      </form>
-    </div>
-  </div>
-</div>
-</body>
-</html>`;
-}
-
-// -------------------- ROUTES --------------------
-
-// health
-app.get("/healthz", (req, res) => {
-  res.json({
-    ok: true,
-    ts: nowIso(),
-    redis: !!redis,
-    db: !!pool,
-    otp_mode: OTP_MODE,
-    kvkk_version: KVKK_VERSION,
-    admin_user_set: !!ADMIN_USER,
-  });
-});
-
-// Splash entry
-app.get(["/", "/splash"], async (req, res) => {
-  const p = extractMerakiParams(req);
-
-  log("SPLASH_OPEN", {
-    hasBaseGrant: !!p.base_grant_url,
-    hasContinue: !!p.continue_url,
-    hasClientMac: !!p.client_mac,
-    mode: OTP_MODE,
-  });
-
-  if (!p.base_grant_url) {
-    // bazen Meraki paramları yokken direkt açılabilir; yine de UI gösterelim
-  }
-
-  // UI’da hidden olarak taşıyalım
-  const hidden = {
-    base_grant_url: p.base_grant_url || "",
-    continue_url: p.continue_url || "",
-    client_mac: p.client_mac || "",
-    client_ip: p.client_ip || "",
-    node_mac: p.node_mac || "",
-    node_id: p.node_id || "",
-    gateway_id: p.gateway_id || "",
-    ssid: p.ssid || "",
-    ap_name: p.ap_name || "",
-  };
-
-  res.status(200).send(
-    splashHtml({
-      kvkkVersion: KVKK_VERSION,
-      hidden,
-      error: null,
-    })
-  );
-});
-
-// Create OTP
-app.post("/otp/create", async (req, res) => {
-  try {
-    const first_name = safeText(req.body.first_name);
-    const last_name = safeText(req.body.last_name);
-    const phone = normalizePhone(req.body.phone);
-    const kvkk_accepted = req.body.kvkk_accepted === "true" || req.body.kvkk_accepted === true;
-
-    const p = {
-      base_grant_url: safeText(req.body.base_grant_url),
-      continue_url: safeText(req.body.continue_url),
-      client_mac: safeText(req.body.client_mac),
-      client_ip: safeText(req.body.client_ip),
-      node_mac: safeText(req.body.node_mac),
-      node_id: safeText(req.body.node_id),
-      gateway_id: safeText(req.body.gateway_id),
-      ssid: safeText(req.body.ssid),
-      ap_name: safeText(req.body.ap_name),
-    };
-
-    // Rate limit (basit)
-    if (p.client_mac && !rateAllow(rateKeyMac(p.client_mac), RL_MAC_SECONDS)) {
-      return res.status(429).send(otpHtml({ error: "Çok fazla deneme. Lütfen biraz sonra tekrar deneyin.", hidden: {} }));
-    }
-    if (phone && !rateAllow(rateKeyPhone(phone), RL_PHONE_SECONDS)) {
-      return res.status(429).send(otpHtml({ error: "Çok fazla deneme. Lütfen biraz sonra tekrar deneyin.", hidden: {} }));
-    }
-
-    if (!first_name || !last_name || !phone || !kvkk_accepted) {
-      return res.status(400).send(
-        splashHtml({
-          kvkkVersion: KVKK_VERSION,
-          hidden: { ...p },
-          error: "Lütfen ad/soyad/telefon ve KVKK onayını doldurun.",
-        })
-      );
-    }
-
-    // OTP üret
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
-    const marker = String(Math.floor(100000 + Math.random() * 900000));
-
-    const payload = {
-      marker,
-      otp,
-      created_at: nowIso(),
-      wrong: 0,
-      locked_until: 0,
-      first_name,
-      last_name,
-      phone,
-      kvkk_accepted: true,
-      kvkk_version: KVKK_VERSION,
-      meraki: p,
-    };
-
-    await otpSet(marker, payload);
-
-    log("OTP_CREATED", { marker, last4: phone.slice(-4), client_mac: p.client_mac });
-
-    // 5651 log: OTP_CREATED
-    await insertLog({
-      event: "OTP_CREATED",
-      first_name,
-      last_name,
-      phone,
-      kvkk_accepted: true,
-      kvkk_version: KVKK_VERSION,
-      client_mac: p.client_mac,
-      client_ip: p.client_ip,
-      ssid: p.ssid,
-      ap_name: p.ap_name,
-      base_grant_url: p.base_grant_url,
-      continue_url: p.continue_url,
-      node_mac: p.node_mac,
-      node_id: p.node_id,
-      gateway_id: p.gateway_id,
-      public_ip: getPublicIp(req),
-      user_agent: safeText(req.headers["user-agent"]),
-      meta: { otp_mode: OTP_MODE },
-    }).catch((e) => log("DB LOG ERROR:", e?.message || e));
-
-    // screen mode: kodu ekranda göster (sms sonra)
-    const hidden = { marker };
-    res.status(200).send(
-      otpHtml({
-        hidden,
-        debugCode: OTP_MODE === "screen" ? otp : null,
-        error: null,
-      })
-    );
-  } catch (e) {
-    log("OTP_CREATE_ERR", e);
-    res.status(500).send("Server error");
-  }
-});
-
-// Verify OTP and grant
-app.post("/otp/verify", async (req, res) => {
-  try {
-    const marker = safeText(req.body.marker);
-    const otp = safeText(req.body.otp);
-
-    if (!marker || !otp) return res.status(400).send("Missing marker/otp");
-
-    const obj = await otpGet(marker);
-    if (!obj) return res.status(400).send(otpHtml({ hidden: { marker }, error: "Kod süresi doldu. Baştan deneyin." }));
-
-    // lock / wrong attempts
-    const now = Date.now();
-    if (obj.locked_until && obj.locked_until > now) {
-      return res.status(429).send(otpHtml({ hidden: { marker }, error: "Çok fazla yanlış deneme. Biraz bekleyin." }));
-    }
-
-    if (String(obj.otp) !== String(otp)) {
-      obj.wrong = (obj.wrong || 0) + 1;
-      if (obj.wrong >= MAX_WRONG_ATTEMPTS) {
-        obj.locked_until = now + LOCK_SECONDS * 1000;
-      }
-      await otpSet(marker, obj);
-      return res.status(400).send(otpHtml({ hidden: { marker }, error: "Kod hatalı. Tekrar deneyin." }));
-    }
-
-    // OK
-    log("OTP_VERIFY_OK", { marker, client_mac: obj.meraki?.client_mac });
-
-    await insertLog({
-      event: "OTP_VERIFIED",
-      first_name: obj.first_name,
-      last_name: obj.last_name,
-      phone: obj.phone,
-      kvkk_accepted: true,
-      kvkk_version: obj.kvkk_version,
-      client_mac: obj.meraki?.client_mac,
-      client_ip: obj.meraki?.client_ip,
-      ssid: obj.meraki?.ssid,
-      ap_name: obj.meraki?.ap_name,
-      base_grant_url: obj.meraki?.base_grant_url,
-      continue_url: obj.meraki?.continue_url,
-      node_mac: obj.meraki?.node_mac,
-      node_id: obj.meraki?.node_id,
-      gateway_id: obj.meraki?.gateway_id,
-      public_ip: getPublicIp(req),
-      user_agent: safeText(req.headers["user-agent"]),
-      meta: { marker },
-    }).catch((e) => log("DB LOG ERROR:", e?.message || e));
-
-    const redirectUrl = buildGrantRedirectUrl(obj.meraki || {});
-    if (!redirectUrl) {
-      await otpDel(marker);
-      return res.status(200).send("OTP OK but base_grant_url missing.");
-    }
-
-    log("GRANT_CLIENT_REDIRECT:", redirectUrl);
-
-    await otpDel(marker);
-    return res.redirect(302, redirectUrl);
-  } catch (e) {
-    log("OTP_VERIFY_ERR", e);
-    res.status(500).send("Server error");
-  }
-});
-
-// -------------------- ADMIN UI --------------------
-function adminLayout(title, body) {
-  return `<!doctype html>
-<html lang="tr">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>${title}</title>
-  <style>
-    :root{--bg:#0b0f1a;--card:#121a2a;--text:#eaf0ff;--muted:#a7b3d6;--accent:#6e5cff;--danger:#ff4d4d;}
-    body{margin:0;background:radial-gradient(1200px 800px at 70% 10%, #1a2450 0%, var(--bg) 55%);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
-    .wrap{max-width:1200px;margin:0 auto;padding:22px}
-    .card{background:rgba(18,26,42,.92);border:1px solid rgba(255,255,255,.08);border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.35);padding:16px}
-    h1{margin:0 0 12px;font-size:18px}
-    .muted{color:var(--muted)}
-    table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
-    th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.08);vertical-align:top}
-    th{color:rgba(167,179,214,.9);text-align:left;font-weight:800}
-    .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
-    label{display:block;color:var(--muted);font-size:11px;margin-bottom:6px}
-    input,select{padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);outline:none}
-    a.btn, button.btn{display:inline-block;padding:10px 12px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#20e3b2);color:#0b0f1a;font-weight:900;border:none;text-decoration:none;cursor:pointer}
-    a.ghost{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text)}
-    .chip{display:inline-block;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);margin-right:6px}
-    .ok{color:#20e3b2;font-weight:900}
-    .bad{color:var(--danger);font-weight:900}
-    pre{white-space:pre-wrap;word-break:break-word;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);padding:10px;border-radius:12px}
+    body{margin:0;background:#070711;color:#eaeaf2;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:22px;}
+    .card{width:420px;max-width:100%;background:#0c0c18;border:1px solid #23233a;border-radius:18px;padding:18px 16px;box-shadow:0 14px 50px rgba(0,0,0,.45)}
+    h1{font-size:18px;margin:0 0 10px 0;text-align:center}
+    .sub{font-size:12px;opacity:.75;text-align:center;margin-bottom:14px}
+    label{display:block;font-size:12px;opacity:.85;margin:10px 0 6px}
+    input{width:100%;box-sizing:border-box;background:#0f0f1f;border:1px solid #2b2b4a;border-radius:10px;padding:10px;color:#eaeaf2;outline:none}
+    input:focus{border-color:#6aa8ff}
+    .row{display:flex;gap:10px}
+    .row > div{flex:1}
+    .err{background:#2a1020;border:1px solid #5a2340;color:#ffb7d0;padding:10px;border-radius:10px;font-size:12px;margin:10px 0}
+    .btn{width:100%;margin-top:12px;background:#6aa8ff;border:none;border-radius:12px;padding:12px;color:#06101f;font-weight:700;cursor:pointer}
+    .btn:hover{filter:brightness(1.05)}
+    .muted{font-size:11px;opacity:.7;margin-top:10px;text-align:center}
+    .chk{display:flex;gap:8px;align-items:flex-start;margin-top:10px}
+    .chk input{width:auto;margin-top:2px}
+    .codebox{display:flex;gap:8px;align-items:center}
+    .codebox input{flex:1}
   </style>
 </head>
 <body>
   <div class="wrap">
-    ${body}
-    <div class="muted" style="margin-top:14px;font-size:11px">
-      <span class="chip">KVKK_VERSION: ${KVKK_VERSION}</span>
-      <span class="chip">OTP_MODE: ${OTP_MODE}</span>
-      <span class="chip">DB: ${pool ? "on" : "off"}</span>
-      <span class="chip">REDIS: ${redis ? "on" : "off"}</span>
+    <div class="card">
+      ${logo}
+      <h1>Misafir Wi-Fi Girişi</h1>
+      <div class="sub">Devam etmek için bilgilerinizi girin ve doğrulayın.</div>
+
+      ${error ? `<div class="err">${error}</div>` : ""}
+
+      <form method="POST" action="/otp/start?${qs}">
+        <div class="row">
+          <div>
+            <label>Ad</label>
+            <input name="first_name" value="${escapeHtml(first_name)}" required />
+          </div>
+          <div>
+            <label>Soyad</label>
+            <input name="last_name" value="${escapeHtml(last_name)}" required />
+          </div>
+        </div>
+
+        <label>Cep Telefonu</label>
+        <input name="phone" placeholder="05xx..." value="${escapeHtml(phone)}" required />
+
+        ${kvkkHtml}
+        <div class="chk">
+          <input type="checkbox" name="kvkk_accepted" value="true" ${kvkkAccepted ? "checked" : ""} required />
+          <div style="font-size:12px;opacity:.9">KVKK metnini okudum, anladım ve onaylıyorum.</div>
+        </div>
+
+        <button class="btn" type="submit">Kod Göster</button>
+        <div class="muted">OTP ekran üzerinde gösterilir (SMS kapalı).</div>
+      </form>
+
+      ${marker ? `
+        <hr style="border:0;border-top:1px solid #23233a;margin:14px 0"/>
+        <form method="POST" action="/otp/verify?${qs}">
+          <input type="hidden" name="marker" value="${escapeHtml(marker)}"/>
+          <div class="codebox">
+            <div style="flex:1">
+              <label>Kod</label>
+              <input name="otp" placeholder="6 haneli kod" inputmode="numeric" required />
+            </div>
+          </div>
+          <button class="btn" type="submit">Bağlan</button>
+        </form>
+      ` : ""}
+      <div class="muted">KVKK Version: ${escapeHtml(KVKK_VERSION)}</div>
     </div>
   </div>
 </body>
 </html>`;
 }
 
-// Query builder for admin logs
-async function fetchLogs(filters) {
-  if (!pool) return { rows: [], total: 0 };
-
-  const where = [];
-  const vals = [];
-  let i = 1;
-
-  if (filters.sinceHours) {
-    where.push(`created_at >= now() - ($${i}::int || ' hours')::interval`);
-    vals.push(filters.sinceHours);
-    i++;
-  }
-  if (filters.phone) {
-    where.push(`phone ILIKE $${i}`);
-    vals.push(`%${filters.phone}%`);
-    i++;
-  }
-  if (filters.mac) {
-    where.push(`client_mac ILIKE $${i}`);
-    vals.push(`%${filters.mac}%`);
-    i++;
-  }
-  if (filters.ip) {
-    where.push(`client_ip ILIKE $${i}`);
-    vals.push(`%${filters.ip}%`);
-    i++;
-  }
-  if (filters.event) {
-    where.push(`event = $${i}`);
-    vals.push(filters.event);
-    i++;
-  }
-
-  const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  const limit = Math.min(Number(filters.limit || 200), 2000);
-  const offset = Math.max(Number(filters.offset || 0), 0);
-
-  const totalQ = await pool.query(`SELECT COUNT(*)::bigint AS c FROM access_logs ${w};`, vals);
-  const q = await pool.query(
-    `SELECT * FROM access_logs ${w} ORDER BY id DESC LIMIT ${limit} OFFSET ${offset};`,
-    vals
-  );
-  return { rows: q.rows || [], total: Number(totalQ.rows?.[0]?.c || 0) };
+function escapeHtml(s) {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-// Admin logs UI
-app.get("/admin/logs", basicAuth, async (req, res) => {
+// -------------------- Routes --------------------
+
+// Health
+app.get("/health", (req, res) => res.status(200).send("ok"));
+
+// Splash landing
+app.get("/", async (req, res) => {
+  const params = parseMerakiParams(req);
+  params.rawQuery = req.query || {};
+
+  console.log("SPLASH_OPEN", {
+    hasBaseGrant: params.hasBaseGrant,
+    hasContinue: params.hasContinue,
+    hasClientMac: params.hasClientMac,
+    mode: OTP_MODE,
+  });
+
+  await logDb("SPLASH_OPEN", {
+    client_mac: params.client_mac,
+    client_ip: params.client_ip || getReqPublicIp(req),
+    ssid: params.ssid,
+    ap_name: params.ap_name,
+    base_grant_url: params.base_grant_url,
+    continue_url: params.continue_url,
+    kvkk_version: KVKK_VERSION,
+    meta: { query: params.rawQuery, ua: req.headers["user-agent"] || null },
+  });
+
+  return res.status(200).send(renderSplashForm(params, { kvkkAccepted: false }));
+});
+
+// Start OTP (screen mode shows OTP in server log only; UI asks user to enter it)
+app.post("/otp/start", async (req, res) => {
+  const params = parseMerakiParams(req);
+  params.rawQuery = req.query || {};
+
+  const first_name = safeText(req.body.first_name, 64);
+  const last_name = safeText(req.body.last_name, 64);
+  const phone = normalizePhone(req.body.phone);
+  const kvkk_accepted = (req.body.kvkk_accepted === "true" || req.body.kvkk_accepted === true);
+
+  if (!params.client_mac) {
+    return res.status(400).send(renderSplashForm(params, { error: "client_mac eksik (Meraki parametresi).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
+  }
+
+  if (!kvkk_accepted) {
+    return res.status(400).send(renderSplashForm(params, { error: "KVKK onayı gerekli.", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
+  }
+
+  if (!redisEnabled) {
+    return res.status(503).send(renderSplashForm(params, { error: "Redis bağlı değil (OTP store yok).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
+  }
+
+  const mac = normalizeMac(params.client_mac);
+  if (await isLocked(mac)) {
+    await logDb("LOCKED", { client_mac: mac, phone, first_name, last_name, kvkk_accepted, kvkk_version: KVKK_VERSION, meta: { reason: "lock" } });
+    return res.status(429).send(renderSplashForm(params, { error: "Çok fazla hatalı deneme. Bir süre sonra tekrar deneyin.", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
+  }
+
+  if (!(await rateLimitByMac(mac))) {
+    return res.status(429).send(renderSplashForm(params, { error: "Çok hızlı deneme (MAC rate limit).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
+  }
+  if (!(await rateLimitByPhone(phone))) {
+    return res.status(429).send(renderSplashForm(params, { error: "Çok hızlı deneme (Telefon rate limit).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
+  }
+
+  const { marker, otp } = await otpCreate({
+    phone,
+    client_mac: mac,
+    meta: {
+      first_name,
+      last_name,
+      client_ip: params.client_ip || getReqPublicIp(req),
+      base_grant_url: params.base_grant_url,
+      continue_url: params.continue_url,
+      gateway_id: params.gateway_id,
+      node_id: params.node_id,
+      node_mac: params.node_mac,
+      ssid: params.ssid,
+      ap_name: params.ap_name,
+      kvkk_accepted: true,
+      kvkk_version: KVKK_VERSION,
+    },
+  });
+
+  console.log("OTP_CREATED", { marker, last4: phone.slice(-4), client_mac: mac });
+
+  await logDb("OTP_CREATED", {
+    first_name, last_name, phone,
+    client_mac: mac,
+    client_ip: params.client_ip || getReqPublicIp(req),
+    ssid: params.ssid,
+    ap_name: params.ap_name,
+    base_grant_url: params.base_grant_url,
+    continue_url: params.continue_url,
+    marker,
+    kvkk_accepted: true,
+    kvkk_version: KVKK_VERSION,
+    meta: { mode: OTP_MODE },
+  });
+
+  // Screen mode: show OTP in server logs only (you can choose to show on UI; currently NOT showing for security)
+  console.log("OTP_SCREEN_CODE", { marker, otp });
+
+  // Render verify form (marker included)
+  return res.status(200).send(renderSplashForm(params, {
+    marker,
+    phone,
+    first_name,
+    last_name,
+    kvkkAccepted: true,
+  }));
+});
+
+// Verify OTP
+app.post("/otp/verify", async (req, res) => {
+  const params = parseMerakiParams(req);
+  params.rawQuery = req.query || {};
+
+  const marker = safeText(req.body.marker, 64);
+  const otp = safeText(req.body.otp, 16);
+
+  if (!redisEnabled) {
+    return res.status(503).send("redis not ready");
+  }
+  if (!marker || !otp) {
+    return res.status(400).send("missing marker/otp");
+  }
+
+  const d = await otpGet(marker);
+  if (!d) {
+    await logDb("OTP_EXPIRED", {
+      marker,
+      client_mac: params.client_mac || null,
+      client_ip: params.client_ip || getReqPublicIp(req),
+      kvkk_version: KVKK_VERSION,
+      meta: { reason: "not_found" },
+    });
+    return res.status(400).send(renderSplashForm(params, { error: "Kod süresi dolmuş. Tekrar deneyin." }));
+  }
+
+  const mac = normalizeMac(d.client_mac || params.client_mac || "");
+  if (await isLocked(mac)) {
+    return res.status(429).send(renderSplashForm(params, { error: "Hesap kilitli. Bir süre sonra tekrar deneyin." }));
+  }
+
+  if (String(d.otp) !== String(otp)) {
+    const bumped = await otpBumpWrong(marker);
+    const wrong = bumped ? (bumped.wrong || 0) : 1;
+
+    await logDb("OTP_WRONG", {
+      marker,
+      phone: d.phone,
+      client_mac: mac,
+      client_ip: (d.meta && d.meta.client_ip) ? d.meta.client_ip : (params.client_ip || getReqPublicIp(req)),
+      kvkk_version: KVKK_VERSION,
+      meta: { wrong },
+    });
+
+    if (wrong >= MAX_WRONG_ATTEMPTS) {
+      await lockMac(mac, "too_many_wrong");
+      await logDb("LOCK_SET", { client_mac: mac, phone: d.phone, marker, kvkk_version: KVKK_VERSION, meta: { wrong } });
+      return res.status(429).send(renderSplashForm(params, { error: "Çok fazla hatalı deneme. Kilitlendi." }));
+    }
+
+    return res.status(400).send(renderSplashForm(params, { error: "Kod yanlış.", marker }));
+  }
+
+  await otpConsume(marker);
+
+  console.log("OTP_VERIFY_OK", { marker, client_mac: mac });
+
+  await logDb("OTP_VERIFIED", {
+    marker,
+    first_name: d.meta?.first_name || null,
+    last_name: d.meta?.last_name || null,
+    phone: d.phone,
+    client_mac: mac,
+    client_ip: d.meta?.client_ip || params.client_ip || getReqPublicIp(req),
+    ssid: d.meta?.ssid || params.ssid,
+    ap_name: d.meta?.ap_name || params.ap_name,
+    base_grant_url: d.meta?.base_grant_url || params.base_grant_url,
+    continue_url: d.meta?.continue_url || params.continue_url,
+    kvkk_accepted: true,
+    kvkk_version: d.meta?.kvkk_version || KVKK_VERSION,
+    meta: { mode: OTP_MODE },
+  });
+
+  // Build grant redirect URL
+  const merakiParams = {
+    ...params,
+    base_grant_url: d.meta?.base_grant_url || params.base_grant_url,
+    continue_url: d.meta?.continue_url || params.continue_url,
+    gateway_id: d.meta?.gateway_id || params.gateway_id,
+    node_id: d.meta?.node_id || params.node_id,
+    client_ip: d.meta?.client_ip || params.client_ip,
+    client_mac: d.meta?.client_mac || params.client_mac,
+    node_mac: d.meta?.node_mac || params.node_mac,
+  };
+
+  const redirectUrl = buildGrantClientRedirect(merakiParams);
+
+  console.log("GRANT_CLIENT_REDIRECT:", redirectUrl);
+
+  await logDb("GRANT_REDIRECT", {
+    marker,
+    phone: d.phone,
+    client_mac: mac,
+    client_ip: d.meta?.client_ip || params.client_ip || getReqPublicIp(req),
+    base_grant_url: merakiParams.base_grant_url,
+    continue_url: merakiParams.continue_url,
+    kvkk_version: d.meta?.kvkk_version || KVKK_VERSION,
+    meta: { redirect: redirectUrl },
+  });
+
+  if (!redirectUrl) {
+    return res.status(400).send("missing base_grant_url");
+  }
+
+  // Redirect client browser to Meraki grant endpoint
+  return res.redirect(302, redirectUrl);
+});
+
+// -------------------- Admin: Logs --------------------
+app.get("/admin/logs", requireAdmin, async (req, res) => {
   try {
-    const sinceHours = safeText(req.query.h || "24");
-    const phone = safeText(req.query.phone);
-    const mac = safeText(req.query.mac);
-    const ip = safeText(req.query.ip);
-    const event = safeText(req.query.event);
-    const limit = safeText(req.query.limit || "200");
-    const offset = safeText(req.query.offset || "0");
+    if (!dbEnabled) return res.status(503).send("db not configured");
 
-    const { rows, total } = await fetchLogs({ sinceHours, phone, mac, ip, event, limit, offset });
+    const limit = Math.min(parseInt(req.query.limit || "200", 10), 1000);
+    const rows = await qRows(`
+      SELECT id, created_at, event, first_name, last_name, phone, client_mac, client_ip, marker, kvkk_version
+      FROM access_logs
+      ORDER BY id DESC
+      LIMIT $1
+    `, [limit]);
 
-    const events = ["OTP_CREATED", "OTP_VERIFIED"];
-    const rowsHtml = rows
-      .map((r) => {
-        const ok = r.row_hash && (r.prev_hash !== undefined);
-        return `<tr>
-          <td>${r.id}</td>
-          <td>${new Date(r.created_at).toLocaleString("tr-TR")}</td>
-          <td><b>${r.event}</b></td>
-          <td>${(r.first_name || "")} ${(r.last_name || "")}<div class="muted">${r.phone || ""}</div></td>
-          <td>${r.client_mac || ""}<div class="muted">${r.client_ip || ""}</div></td>
-          <td>${r.ssid || ""}<div class="muted">${r.ap_name || ""}</div></td>
-          <td>${r.kvkk_accepted ? `<span class="ok">true</span>` : `<span class="bad">false</span>`}<div class="muted">${r.kvkk_version || ""}</div></td>
-          <td>${ok ? `<span class="ok">hash</span>` : `<span class="bad">-</span>`}</td>
-        </tr>`;
-      })
-      .join("");
-
-    const body = `
-      <div class="card">
-        <h1>5651 Logları</h1>
-        <div class="muted">Filtrele, görüntüle, dışa aktar (CSV/JSON) ve hash-zincir doğrulama.</div>
-
-        <form class="toolbar" method="GET" action="/admin/logs">
-          <div>
-            <label>Son kaç saat</label>
-            <input name="h" value="${sinceHours || ""}" style="width:110px"/>
-          </div>
-          <div>
-            <label>Telefon</label>
-            <input name="phone" value="${phone || ""}" placeholder="0533..."/>
-          </div>
-          <div>
-            <label>MAC</label>
-            <input name="mac" value="${mac || ""}" placeholder="96:47:..."/>
-          </div>
-          <div>
-            <label>IP</label>
-            <input name="ip" value="${ip || ""}" placeholder="10.120..."/>
-          </div>
-          <div>
-            <label>Event</label>
-            <select name="event">
-              <option value="">(hepsi)</option>
-              ${events.map((e) => `<option value="${e}" ${event === e ? "selected" : ""}>${e}</option>`).join("")}
-            </select>
-          </div>
-          <div>
-            <label>Limit</label>
-            <input name="limit" value="${limit || ""}" style="width:90px"/>
-          </div>
-          <div>
-            <input type="hidden" name="offset" value="0"/>
-            <button class="btn" type="submit">Uygula</button>
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <a class="btn ghost" href="/admin/export.csv?h=${encodeURIComponent(sinceHours || "")}&phone=${encodeURIComponent(phone || "")}&mac=${encodeURIComponent(mac || "")}&ip=${encodeURIComponent(ip || "")}&event=${encodeURIComponent(event || "")}">CSV</a>
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <a class="btn ghost" href="/admin/export.json?h=${encodeURIComponent(sinceHours || "")}&phone=${encodeURIComponent(phone || "")}&mac=${encodeURIComponent(mac || "")}&ip=${encodeURIComponent(ip || "")}&event=${encodeURIComponent(event || "")}">JSON</a>
-          </div>
-          <div>
-            <label>&nbsp;</label>
-            <a class="btn ghost" href="/admin/verify-chain?h=${encodeURIComponent(sinceHours || "")}">Hash Doğrula</a>
-          </div>
-        </form>
-
-        <div style="margin-top:10px" class="muted">
-          Toplam: <b>${total}</b> | Gösterilen: <b>${rows.length}</b>
-        </div>
-
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Zaman</th><th>Event</th><th>Kullanıcı</th><th>Cihaz</th><th>SSID/AP</th><th>KVKK</th><th>İmza</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rowsHtml || `<tr><td colspan="8" class="muted">Kayıt yok</td></tr>`}
-          </tbody>
-        </table>
-
-        <div style="margin-top:12px" class="muted">
-          Not: “İmzalama” şu an <b>HMAC hash-zinciri</b> (placeholder). Gerçek e-imza/HSM entegrasyonu istersen bir sonraki adımda “gün sonu imzalı paket” formatına geçeriz.
-        </div>
-      </div>
-    `;
-
-    res.status(200).send(adminLayout("Admin Logs", body));
+    const html = `<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Admin Logs</title>
+<style>
+body{font-family:system-ui;background:#0b0b12;color:#eaeaf2;margin:24px}
+a{color:#9dd1ff}
+table{width:100%;border-collapse:collapse;background:#111124;border:1px solid #23233a;border-radius:12px;overflow:hidden}
+th,td{padding:9px 10px;border-bottom:1px solid #23233a;font-size:13px}
+th{background:#15152c;text-align:left}
+tr:hover td{background:#141428}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.btn{display:inline-block;padding:6px 10px;border:1px solid #2b2b4a;border-radius:8px;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="top">
+  <h2 style="margin:0">/admin/logs</h2>
+  <div style="display:flex;gap:8px">
+    <a class="btn" href="/admin/daily">Daily</a>
+    <a class="btn" href="/admin/logs?limit=${limit}">Refresh</a>
+  </div>
+</div>
+<table>
+<thead><tr>
+<th>id</th><th>time</th><th>event</th><th>name</th><th>phone</th><th>mac</th><th>ip</th><th>marker</th><th>kvkk</th>
+</tr></thead>
+<tbody>
+${rows.map(r => `
+<tr>
+<td>${r.id}</td>
+<td>${escapeHtml(String(r.created_at))}</td>
+<td>${escapeHtml(r.event)}</td>
+<td>${escapeHtml((r.first_name||"") + " " + (r.last_name||""))}</td>
+<td>${escapeHtml(r.phone||"")}</td>
+<td>${escapeHtml(r.client_mac||"")}</td>
+<td>${escapeHtml(r.client_ip||"")}</td>
+<td>${escapeHtml(r.marker||"")}</td>
+<td>${escapeHtml(r.kvkk_version||"")}</td>
+</tr>
+`).join("")}
+</tbody>
+</table>
+</body></html>`;
+    return res.status(200).send(html);
   } catch (e) {
-    log("ADMIN_LOGS_ERR", e);
-    res.status(500).send(adminLayout("Admin Logs", `<div class="card"><h1>Hata</h1><pre>${String(e?.stack || e)}</pre></div>`));
+    console.error("ADMIN_LOGS_ERR", e);
+    return res.status(500).send("admin logs error");
   }
 });
 
-// Export CSV
-app.get("/admin/export.csv", basicAuth, async (req, res) => {
+// -------------------- Admin: Daily (5651) --------------------
+app.get("/admin/daily", requireAdmin, async (req, res) => {
   try {
-    const sinceHours = safeText(req.query.h || "24");
-    const phone = safeText(req.query.phone);
-    const mac = safeText(req.query.mac);
-    const ip = safeText(req.query.ip);
-    const event = safeText(req.query.event);
+    if (!dbEnabled) return res.status(503).send("db not configured");
 
-    const { rows } = await fetchLogs({ sinceHours, phone, mac, ip, event, limit: 2000, offset: 0 });
+    const rows = await qRows(`
+      SELECT day, tz, record_count, day_hash, chain_hash, prev_day_hash, created_at, updated_at, signed_at
+      FROM daily_packages
+      ORDER BY day DESC
+      LIMIT 60
+    `);
 
-    const headers = [
-      "id","created_at","event","first_name","last_name","phone","kvkk_accepted","kvkk_version",
-      "client_mac","client_ip","ssid","ap_name","base_grant_url","continue_url",
-      "node_mac","node_id","gateway_id","public_ip","user_agent","prev_hash","row_hash","meta"
-    ];
+    const html = `<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>5651 Daily Packages</title>
+<style>
+body{font-family:system-ui;background:#0b0b12;color:#eaeaf2;margin:24px}
+a{color:#9dd1ff}
+table{width:100%;border-collapse:collapse;background:#111124;border:1px solid #23233a;border-radius:12px;overflow:hidden}
+th,td{padding:9px 10px;border-bottom:1px solid #23233a;font-size:13px}
+th{background:#15152c;text-align:left}
+tr:hover td{background:#141428}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px}
+.btn{display:inline-block;padding:6px 10px;border:1px solid #2b2b4a;border-radius:8px;text-decoration:none;background:transparent;color:#eaeaf2}
+input{padding:8px 10px;border-radius:8px;border:1px solid #2b2b4a;background:#0f0f1f;color:#eaeaf2}
+.card{background:#111124;border:1px solid #23233a;border-radius:12px;padding:10px}
+.small{font-size:12px;opacity:.75}
+</style></head>
+<body>
+<div class="top">
+  <div>
+    <h2 style="margin:0 0 4px 0;">/admin/daily</h2>
+    <div class="small">Günlük paket: canonical JSON → day_hash → chain_hash (GENESIS zinciri). İmzalama placeholder.</div>
+  </div>
+  <div class="card">
+    <form method="GET" action="/admin/daily/build" style="display:flex;gap:8px;align-items:center;margin:0">
+      <input name="day" placeholder="YYYY-MM-DD" />
+      <button class="btn" type="submit">Build/Update</button>
+      <a class="btn" href="/admin/logs">Logs</a>
+    </form>
+  </div>
+</div>
 
-    const csvEscape = (v) => {
-      if (v === null || v === undefined) return "";
-      const s = typeof v === "string" ? v : JSON.stringify(v);
-      if (/[,"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-      return s;
+<table>
+<thead><tr>
+<th>day</th><th>count</th><th>day_hash</th><th>chain_hash</th><th>signed</th><th>actions</th>
+</tr></thead>
+<tbody>
+${rows.map(x => `
+<tr>
+<td>${String(x.day).slice(0,10)}</td>
+<td>${x.record_count}</td>
+<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(x.day_hash)}</td>
+<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(x.chain_hash)}</td>
+<td>${x.signed_at ? "yes" : "no"}</td>
+<td>
+  <a class="btn" href="/admin/daily/${String(x.day).slice(0,10)}/export.json">export</a>
+  <a class="btn" href="/admin/daily/${String(x.day).slice(0,10)}/verify">verify</a>
+</td>
+</tr>
+`).join("")}
+</tbody>
+</table>
+</body></html>`;
+
+    return res.status(200).send(html);
+  } catch (e) {
+    console.error("ADMIN_DAILY_ERR", e);
+    return res.status(500).send("admin daily error");
+  }
+});
+
+app.get("/admin/daily/build", requireAdmin, async (req, res) => {
+  try {
+    if (!dbEnabled) return res.status(503).send("db not configured");
+    const day = String(req.query.day || "").trim();
+    if (!isYmd(day)) return res.status(400).send("day must be YYYY-MM-DD");
+    const out = await buildDailyPackage(day, TZ);
+    return res.status(200).send(`<pre>${escapeHtml(JSON.stringify(out, null, 2))}</pre><p><a href="/admin/daily">Back</a></p>`);
+  } catch (e) {
+    console.error("ADMIN_DAILY_BUILD_ERR", e);
+    return res.status(500).send("daily build error");
+  }
+});
+
+app.get("/admin/daily/:day/export.json", requireAdmin, async (req, res) => {
+  try {
+    if (!dbEnabled) return res.status(503).send("db not configured");
+    const day = String(req.params.day || "").trim();
+    if (!isYmd(day)) return res.status(400).send("bad day");
+
+    const r = await qRows(`SELECT body_json, day_hash, chain_hash, created_at, updated_at, signed_at, signature_type, signature FROM daily_packages WHERE day=$1::date`, [day]);
+    if (!r.length) return res.status(404).send("not found");
+
+    const row = r[0];
+    const payload = {
+      day,
+      meta: {
+        day_hash: row.day_hash,
+        chain_hash: row.chain_hash,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        signed_at: row.signed_at,
+        signature_type: row.signature_type,
+        signature: row.signature,
+      },
+      body: row.body_json,
     };
 
-    let out = headers.join(",") + "\n";
-    for (const r of rows) {
-      const line = headers.map((h) => csvEscape(r[h])).join(",");
-      out += line + "\n";
-    }
-
-    // “paket imzası” placeholder: tüm dosyayı hashle
-    const packSig = hmacHex(SIGNING_SECRET, out);
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("X-Package-Signature", packSig);
-    res.status(200).send(out);
-  } catch (e) {
-    log("EXPORT_CSV_ERR", e);
-    res.status(500).send("export error");
-  }
-});
-
-// Export JSON
-app.get("/admin/export.json", basicAuth, async (req, res) => {
-  try {
-    const sinceHours = safeText(req.query.h || "24");
-    const phone = safeText(req.query.phone);
-    const mac = safeText(req.query.mac);
-    const ip = safeText(req.query.ip);
-    const event = safeText(req.query.event);
-
-    const { rows } = await fetchLogs({ sinceHours, phone, mac, ip, event, limit: 2000, offset: 0 });
-
-    const payload = { exported_at: nowIso(), rows };
-    const raw = JSON.stringify(payload);
-    const packSig = hmacHex(SIGNING_SECRET, raw);
-
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("X-Package-Signature", packSig);
-    res.status(200).send(raw);
+    res.setHeader("Content-Disposition", `attachment; filename="5651_${day}.json"`);
+    return res.status(200).send(JSON.stringify(payload, null, 2));
   } catch (e) {
-    log("EXPORT_JSON_ERR", e);
-    res.status(500).send("export error");
+    console.error("ADMIN_DAILY_EXPORT_ERR", e);
+    return res.status(500).send("export error");
   }
 });
 
-// Verify hash-chain
-app.get("/admin/verify-chain", basicAuth, async (req, res) => {
+app.get("/admin/daily/:day/verify", requireAdmin, async (req, res) => {
   try {
-    const sinceHours = safeText(req.query.h || "24");
+    if (!dbEnabled) return res.status(503).send("db not configured");
+    const day = String(req.params.day || "").trim();
+    if (!isYmd(day)) return res.status(400).send("bad day");
 
-    if (!pool) return res.status(500).send("DB not configured");
-
-    const q = await pool.query(
-      `SELECT * FROM access_logs WHERE created_at >= now() - ($1::int || ' hours')::interval ORDER BY id ASC;`,
-      [sinceHours]
-    );
-
-    let ok = 0;
-    let bad = 0;
-    let lastHash = null;
-    const badSamples = [];
-
-    for (const r of q.rows) {
-      const row = {
-        created_at: new Date(r.created_at).toISOString(),
-        event: r.event,
-        first_name: r.first_name,
-        last_name: r.last_name,
-        phone: r.phone,
-        kvkk_accepted: r.kvkk_accepted,
-        kvkk_version: r.kvkk_version,
-        client_mac: r.client_mac,
-        client_ip: r.client_ip,
-        ssid: r.ssid,
-        ap_name: r.ap_name,
-        base_grant_url: r.base_grant_url,
-        continue_url: r.continue_url,
-        node_mac: r.node_mac,
-        node_id: r.node_id,
-        gateway_id: r.gateway_id,
-        public_ip: r.public_ip,
-        user_agent: r.user_agent,
-        meta: r.meta,
-        prev_hash: r.prev_hash,
-      };
-
-      const canon = canonicalRowForHash(row);
-      const expected = hmacHex(SIGNING_SECRET, canon);
-
-      const chainOk = (r.prev_hash || null) === (lastHash || null);
-      const hashOk = expected === r.row_hash;
-
-      if (chainOk && hashOk) ok++;
-      else {
-        bad++;
-        if (badSamples.length < 10) {
-          badSamples.push({ id: r.id, chainOk, hashOk, prev_db: r.prev_hash, prev_calc: lastHash, row_hash_db: r.row_hash, row_hash_calc: expected });
-        }
-      }
-      lastHash = r.row_hash || lastHash;
-    }
-
-    const body = `
-      <div class="card">
-        <h1>Hash Zinciri Doğrulama</h1>
-        <div class="muted">Son ${sinceHours} saatlik kayıtlar için kontrol.</div>
-        <div style="margin-top:10px">
-          <span class="chip">OK: <b class="ok">${ok}</b></span>
-          <span class="chip">BAD: <b class="bad">${bad}</b></span>
-        </div>
-        ${bad ? `<h3 style="margin-top:14px">Örnek Hatalar</h3><pre>${JSON.stringify(badSamples, null, 2)}</pre>` : `<div style="margin-top:12px" class="ok">Zincir sağlam ✅</div>`}
-        <div style="margin-top:12px" class="muted">
-          Not: Bu yöntem “değiştirilemezlik kanıtı” sağlar. 5651 için gerçek dünyada ayrıca <b>zaman damgası</b> ve/veya <b>e-imza</b> ile “gün sonu” paket imzalama yapılır.
-        </div>
-        <div style="margin-top:12px">
-          <a class="btn ghost" href="/admin/logs">Geri</a>
-        </div>
-      </div>
-    `;
-    res.status(200).send(adminLayout("Verify Chain", body));
+    const out = await verifyDailyPackage(day);
+    return res.status(200).send(`<h3>Verify ${escapeHtml(day)}</h3><pre>${escapeHtml(JSON.stringify(out, null, 2))}</pre><p><a href="/admin/daily">Back</a></p>`);
   } catch (e) {
-    log("VERIFY_CHAIN_ERR", e);
-    res.status(500).send(adminLayout("Verify Chain", `<div class="card"><h1>Hata</h1><pre>${String(e?.stack || e)}</pre></div>`));
+    console.error("ADMIN_DAILY_VERIFY_ERR", e);
+    return res.status(500).send("verify error");
   }
 });
 
-// -------------------- STARTUP --------------------
-(async () => {
+// -------------------- Start --------------------
+async function main() {
   try {
-    log("ENV:", {
-      OTP_MODE,
-      OTP_TTL_SECONDS,
-      RL_MAC_SECONDS,
-      RL_PHONE_SECONDS,
-      MAX_WRONG_ATTEMPTS,
-      LOCK_SECONDS,
-      KVKK_VERSION,
-      ADMIN_USER_SET: !!ADMIN_USER,
-      ADMIN_PASS_SET: !!ADMIN_PASS,
-      REDIS: !!redis,
-      DB: !!pool,
-    });
-
-    if (redis) log("REDIS: connected");
-    else log("REDIS: not configured");
-
-    if (pool) await dbInit();
-
-    app.listen(PORT, () => {
-      log(`Server running on port ${PORT}`);
-    });
+    await initRedis();
+    await initDb();
   } catch (e) {
-    log("BOOT_ERR", e);
-    process.exit(1);
+    console.error("INIT_ERROR", e);
   }
-})();
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+main();
