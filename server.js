@@ -988,7 +988,7 @@ async function upsertPackage(day, content_json, content_hash, signature_hmac) {
 
 app.get('/admin/daily', adminRequired, async (req, res) => {
   const rows = await qRows(
-    `SELECT h.day, h.tz, h.record_count, h.day_hash, c.chain_hash, c.signature_hmac
+    `SELECT h.day, c.tz, h.record_count, h.day_hash, c.chain_hash, c.signature_hmac
      FROM daily_hashes h
      LEFT JOIN daily_chains c ON c.day=h.day
      ORDER BY h.day DESC
