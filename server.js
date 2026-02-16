@@ -1,17 +1,16 @@
 /**
- * server.js - Meraki captive portal helper
- * - OTP_MODE=screen (SMS yok)
- * - Redis: OTP store (persist)
+ * server.js - Meraki captive portal helper (FINAL)
+ * - OTP_MODE=screen -> OTP kodu ekranda da görünür (SMS yok)
+ * - Redis: OTP store
  * - Postgres: 5651 access_logs + daily_packages (hash/zincir)
  * - Admin UI: /admin/logs, /admin/daily (Basic Auth)
  *
- * ENV required:
- *  - PORT (Railway)
+ * ENV:
+ *  - PORT
  *  - REDIS_URL or REDIS_PUBLIC_URL
- *  - DATABASE_URL (Postgres)
+ *  - DATABASE_URL
  *  - OTP_MODE=screen
- *  - ADMIN_USER, ADMIN_PASS   (admin endpoints)
- *
+ *  - ADMIN_USER, ADMIN_PASS
  * Optional:
  *  - OTP_TTL_SECONDS (default 180)
  *  - RL_MAC_SECONDS (default 30)
@@ -96,9 +95,7 @@ function safeText(x, max = 2000) {
 function normalizePhone(input) {
   if (!input) return "";
   let s = String(input).trim();
-  // keep + and digits
   s = s.replace(/[^\d+]/g, "");
-  // allow starting 0 or +90...
   return s;
 }
 
@@ -108,17 +105,11 @@ function normalizeMac(input) {
 }
 
 function getReqPublicIp(req) {
-  // Prefer x-forwarded-for (Railway uses proxies)
   const xf = req.headers["x-forwarded-for"];
   if (xf) return String(xf).split(",")[0].trim();
   const xr = req.headers["x-real-ip"];
   if (xr) return String(xr).trim();
   return (req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress) : "";
-}
-
-function basicAuthHeader(user, pass) {
-  const token = Buffer.from(`${user}:${pass}`).toString("base64");
-  return `Basic ${token}`;
 }
 
 function requireAdmin(req, res, next) {
@@ -137,6 +128,16 @@ function requireAdmin(req, res, next) {
   } catch (_) {}
   res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
   return res.status(401).send("invalid credentials");
+}
+
+function escapeHtml(s) {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 // -------------------- Redis --------------------
@@ -160,6 +161,76 @@ function rKeyRlMac(mac) { return `rl:mac:${mac}`; }
 function rKeyRlPhone(phone) { return `rl:phone:${phone}`; }
 function rKeyLockMac(mac) { return `lock:mac:${mac}`; }
 
+async function isLocked(mac) {
+  if (!redisEnabled) return false;
+  const v = await redis.get(rKeyLockMac(mac));
+  return !!v;
+}
+
+async function lockMac(mac, reason = "too_many_wrong") {
+  if (!redisEnabled) return;
+  await redis.set(rKeyLockMac(mac), reason, { EX: LOCK_SECONDS });
+}
+
+async function rateLimitByMac(mac) {
+  if (!redisEnabled) return true;
+  const key = rKeyRlMac(mac);
+  const n = await redis.incr(key);
+  if (n === 1) await redis.expire(key, RL_MAC_SECONDS);
+  return n <= 5;
+}
+
+async function rateLimitByPhone(phone) {
+  if (!redisEnabled) return true;
+  const key = rKeyRlPhone(phone);
+  const n = await redis.incr(key);
+  if (n === 1) await redis.expire(key, RL_PHONE_SECONDS);
+  return n <= 5;
+}
+
+function makeMarker() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function otpCreate({ phone, client_mac, meta }) {
+  const marker = makeMarker();
+  const otp = makeMarker();
+  const data = {
+    marker,
+    otp,
+    created_at: nowIso(),
+    phone,
+    client_mac,
+    wrong: 0,
+    meta: meta || null,
+  };
+  if (redisEnabled) {
+    await redis.set(rKeyOtp(marker), JSON.stringify(data), { EX: OTP_TTL_SECONDS });
+  }
+  return { marker, otp };
+}
+
+async function otpGet(marker) {
+  if (!redisEnabled) return null;
+  const v = await redis.get(rKeyOtp(marker));
+  if (!v) return null;
+  try { return JSON.parse(v); } catch { return null; }
+}
+
+async function otpBumpWrong(marker) {
+  if (!redisEnabled) return null;
+  const d = await otpGet(marker);
+  if (!d) return null;
+  d.wrong = (d.wrong || 0) + 1;
+  await redis.set(rKeyOtp(marker), JSON.stringify(d), { EX: OTP_TTL_SECONDS });
+  return d;
+}
+
+async function otpConsume(marker) {
+  if (!redisEnabled) return;
+  await redis.del(rKeyOtp(marker));
+}
+
 // -------------------- Postgres --------------------
 let pool = null;
 let dbEnabled = false;
@@ -178,7 +249,6 @@ async function initDb() {
   dbEnabled = true;
   console.log("DATABASE: connected");
 
-  // access_logs table (client_ip TEXT per your note)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_logs (
       id bigserial PRIMARY KEY,
@@ -207,7 +277,6 @@ async function initDb() {
     );
   `);
 
-  // daily_packages table (5651 daily chain)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS daily_packages (
       day date PRIMARY KEY,
@@ -236,11 +305,9 @@ async function qRows(sql, params = []) {
 
 async function logDb(event, payload) {
   if (!dbEnabled) return;
-
-  // columns expected in payload:
-  // first_name,last_name,phone,client_mac,client_ip,ssid,ap_name,base_grant_url,continue_url,marker,kvkk_accepted,kvkk_version,meta
   const p = payload || {};
-  const client_ip = p.client_ip ? String(p.client_ip) : null; // TEXT
+  const client_ip = p.client_ip ? String(p.client_ip) : null;
+
   const sql = `
     INSERT INTO access_logs(
       event, client_mac, client_ip, ssid, ap_name,
@@ -266,7 +333,6 @@ async function logDb(event, payload) {
     p.kvkk_version ? safeText(p.kvkk_version, 64) : null,
     JSON.stringify(p.meta || null),
   ];
-
   try {
     await pool.query(sql, vals);
   } catch (e) {
@@ -276,10 +342,7 @@ async function logDb(event, payload) {
 
 // -------------------- Meraki param parsing --------------------
 function parseMerakiParams(req) {
-  // Meraki sends gateway_id, node_id, client_ip, client_mac, node_mac, continue_url, etc.
-  // In some flows, base_grant_url is present.
   const q = req.query || {};
-
   const base_grant_url = q.base_grant_url ? String(q.base_grant_url) : "";
   const continue_url = q.continue_url ? String(q.continue_url) : "";
 
@@ -289,7 +352,6 @@ function parseMerakiParams(req) {
   const client_mac = q.client_mac ? String(q.client_mac) : "";
   const node_mac = q.node_mac ? String(q.node_mac) : "";
 
-  // optional
   const ssid = q.ssid ? String(q.ssid) : "";
   const ap_name = q.ap_name ? String(q.ap_name) : "";
 
@@ -313,99 +375,19 @@ function parseMerakiParams(req) {
   };
 }
 
-// Build grant URL for client redirect (Meraki expects browser redirect)
 function buildGrantClientRedirect(params) {
-  // Best practice: redirect client to base_grant_url with required params.
-  // If base_grant_url already includes '?' keep it simple; else add query.
-  // We'll attach required fields if present.
   const base = params.base_grant_url;
   if (!base) return "";
 
   const url = new URL(base);
-  // Meraki required fields often: gateway_id, node_id, client_ip, client_mac, node_mac, continue_url
   if (params.gateway_id) url.searchParams.set("gateway_id", params.gateway_id);
   if (params.node_id) url.searchParams.set("node_id", params.node_id);
   if (params.client_ip) url.searchParams.set("client_ip", params.client_ip);
   if (params.client_mac) url.searchParams.set("client_mac", params.client_mac);
   if (params.node_mac) url.searchParams.set("node_mac", params.node_mac);
-
-  // include continue_url to keep flow smooth
   if (params.continue_url) url.searchParams.set("continue_url", params.continue_url);
 
   return url.toString();
-}
-
-// -------------------- OTP & Rate-limit --------------------
-function makeMarker() {
-  // 6-digit marker
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-async function isLocked(mac) {
-  if (!redisEnabled) return false;
-  const v = await redis.get(rKeyLockMac(mac));
-  return !!v;
-}
-
-async function lockMac(mac, reason = "too_many_wrong") {
-  if (!redisEnabled) return;
-  await redis.set(rKeyLockMac(mac), reason, { EX: LOCK_SECONDS });
-}
-
-async function rateLimitByMac(mac) {
-  if (!redisEnabled) return true;
-  const key = rKeyRlMac(mac);
-  const n = await redis.incr(key);
-  if (n === 1) await redis.expire(key, RL_MAC_SECONDS);
-  return n <= 5; // basic burst
-}
-
-async function rateLimitByPhone(phone) {
-  if (!redisEnabled) return true;
-  const key = rKeyRlPhone(phone);
-  const n = await redis.incr(key);
-  if (n === 1) await redis.expire(key, RL_PHONE_SECONDS);
-  return n <= 5;
-}
-
-async function otpCreate({ phone, client_mac, meta }) {
-  const marker = makeMarker();
-  const otp = makeMarker(); // 6-digit OTP
-  const data = {
-    marker,
-    otp,
-    created_at: nowIso(),
-    phone,
-    client_mac,
-    wrong: 0,
-    meta: meta || null,
-  };
-  if (redisEnabled) {
-    await redis.set(rKeyOtp(marker), JSON.stringify(data), { EX: OTP_TTL_SECONDS });
-  }
-  return { marker, otp };
-}
-
-async function otpGet(marker) {
-  if (!redisEnabled) return null;
-  const v = await redis.get(rKeyOtp(marker));
-  if (!v) return null;
-  try { return JSON.parse(v); } catch { return null; }
-}
-
-async function otpBumpWrong(marker) {
-  if (!redisEnabled) return null;
-  const d = await otpGet(marker);
-  if (!d) return null;
-  d.wrong = (d.wrong || 0) + 1;
-  // Keep remaining TTL: easiest set again with full TTL is OK for now (or you can keep TTL via TTL command)
-  await redis.set(rKeyOtp(marker), JSON.stringify(d), { EX: OTP_TTL_SECONDS });
-  return d;
-}
-
-async function otpConsume(marker) {
-  if (!redisEnabled) return;
-  await redis.del(rKeyOtp(marker));
 }
 
 // -------------------- Daily packages (5651) --------------------
@@ -521,11 +503,18 @@ async function verifyDailyPackage(dayYmd) {
   };
 }
 
-// -------------------- UI (KVKK placeholder + OTP screen) --------------------
+// -------------------- UI --------------------
 function renderSplashForm(params, opts = {}) {
-  const { error = "", marker = "", phone = "", first_name = "", last_name = "", kvkkAccepted = false } = opts;
+  const {
+    error = "",
+    marker = "",
+    otp = "", // <<< OTP ekranda gösterilecek
+    phone = "",
+    first_name = "",
+    last_name = "",
+    kvkkAccepted = false
+  } = opts;
 
-  // simple modern UI
   const logo = `
     <div style="display:flex;justify-content:center;margin-bottom:14px;">
       <div style="width:56px;height:56px;border-radius:16px;background:#1a1a2e;display:flex;align-items:center;justify-content:center;border:1px solid #2b2b4a;">
@@ -541,7 +530,6 @@ function renderSplashForm(params, opts = {}) {
     </div>
   `;
 
-  // keep original meraki query string
   const qs = new URLSearchParams(params.rawQuery || {}).toString();
 
   return `<!doctype html>
@@ -578,7 +566,7 @@ function renderSplashForm(params, opts = {}) {
       <h1>Misafir Wi-Fi Girişi</h1>
       <div class="sub">Devam etmek için bilgilerinizi girin ve doğrulayın.</div>
 
-      ${error ? `<div class="err">${error}</div>` : ""}
+      ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 
       <form method="POST" action="/otp/start?${qs}">
         <div class="row">
@@ -605,6 +593,14 @@ function renderSplashForm(params, opts = {}) {
         <div class="muted">OTP ekran üzerinde gösterilir (SMS kapalı).</div>
       </form>
 
+      ${otp ? `
+        <div style="margin-top:12px;padding:12px;border:1px dashed #6aa8ff;border-radius:12px;background:#0f1730;">
+          <div style="font-size:12px;opacity:.85;margin-bottom:6px">Ekran OTP Kodu</div>
+          <div style="font-size:28px;font-weight:800;letter-spacing:3px;">${escapeHtml(otp)}</div>
+          <div style="font-size:11px;opacity:.75;margin-top:6px">Bu kod ${OTP_TTL_SECONDS} saniye geçerlidir.</div>
+        </div>
+      ` : ""}
+
       ${marker ? `
         <hr style="border:0;border-top:1px solid #23233a;margin:14px 0"/>
         <form method="POST" action="/otp/verify?${qs}">
@@ -618,6 +614,7 @@ function renderSplashForm(params, opts = {}) {
           <button class="btn" type="submit">Bağlan</button>
         </form>
       ` : ""}
+
       <div class="muted">KVKK Version: ${escapeHtml(KVKK_VERSION)}</div>
     </div>
   </div>
@@ -625,22 +622,9 @@ function renderSplashForm(params, opts = {}) {
 </html>`;
 }
 
-function escapeHtml(s) {
-  if (s === null || s === undefined) return "";
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
 // -------------------- Routes --------------------
-
-// Health
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
-// Splash landing
 app.get("/", async (req, res) => {
   const params = parseMerakiParams(req);
   params.rawQuery = req.query || {};
@@ -666,7 +650,6 @@ app.get("/", async (req, res) => {
   return res.status(200).send(renderSplashForm(params, { kvkkAccepted: false }));
 });
 
-// Start OTP (screen mode shows OTP in server log only; UI asks user to enter it)
 app.post("/otp/start", async (req, res) => {
   const params = parseMerakiParams(req);
   params.rawQuery = req.query || {};
@@ -679,11 +662,9 @@ app.post("/otp/start", async (req, res) => {
   if (!params.client_mac) {
     return res.status(400).send(renderSplashForm(params, { error: "client_mac eksik (Meraki parametresi).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
   }
-
   if (!kvkk_accepted) {
     return res.status(400).send(renderSplashForm(params, { error: "KVKK onayı gerekli.", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
   }
-
   if (!redisEnabled) {
     return res.status(503).send(renderSplashForm(params, { error: "Redis bağlı değil (OTP store yok).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
   }
@@ -693,7 +674,6 @@ app.post("/otp/start", async (req, res) => {
     await logDb("LOCKED", { client_mac: mac, phone, first_name, last_name, kvkk_accepted, kvkk_version: KVKK_VERSION, meta: { reason: "lock" } });
     return res.status(429).send(renderSplashForm(params, { error: "Çok fazla hatalı deneme. Bir süre sonra tekrar deneyin.", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
   }
-
   if (!(await rateLimitByMac(mac))) {
     return res.status(429).send(renderSplashForm(params, { error: "Çok hızlı deneme (MAC rate limit).", first_name, last_name, phone, kvkkAccepted: kvkk_accepted }));
   }
@@ -721,6 +701,7 @@ app.post("/otp/start", async (req, res) => {
   });
 
   console.log("OTP_CREATED", { marker, last4: phone.slice(-4), client_mac: mac });
+  console.log("OTP_SCREEN_CODE", { marker, otp });
 
   await logDb("OTP_CREATED", {
     first_name, last_name, phone,
@@ -736,12 +717,9 @@ app.post("/otp/start", async (req, res) => {
     meta: { mode: OTP_MODE },
   });
 
-  // Screen mode: show OTP in server logs only (you can choose to show on UI; currently NOT showing for security)
-  console.log("OTP_SCREEN_CODE", { marker, otp });
-
-  // Render verify form (marker included)
   return res.status(200).send(renderSplashForm(params, {
     marker,
+    otp, // <<< EKLE: OTP ekranda gösterilecek
     phone,
     first_name,
     last_name,
@@ -749,7 +727,6 @@ app.post("/otp/start", async (req, res) => {
   }));
 });
 
-// Verify OTP
 app.post("/otp/verify", async (req, res) => {
   const params = parseMerakiParams(req);
   params.rawQuery = req.query || {};
@@ -757,12 +734,8 @@ app.post("/otp/verify", async (req, res) => {
   const marker = safeText(req.body.marker, 64);
   const otp = safeText(req.body.otp, 16);
 
-  if (!redisEnabled) {
-    return res.status(503).send("redis not ready");
-  }
-  if (!marker || !otp) {
-    return res.status(400).send("missing marker/otp");
-  }
+  if (!redisEnabled) return res.status(503).send("redis not ready");
+  if (!marker || !otp) return res.status(400).send("missing marker/otp");
 
   const d = await otpGet(marker);
   if (!d) {
@@ -823,7 +796,6 @@ app.post("/otp/verify", async (req, res) => {
     meta: { mode: OTP_MODE },
   });
 
-  // Build grant redirect URL
   const merakiParams = {
     ...params,
     base_grant_url: d.meta?.base_grant_url || params.base_grant_url,
@@ -836,7 +808,6 @@ app.post("/otp/verify", async (req, res) => {
   };
 
   const redirectUrl = buildGrantClientRedirect(merakiParams);
-
   console.log("GRANT_CLIENT_REDIRECT:", redirectUrl);
 
   await logDb("GRANT_REDIRECT", {
@@ -850,11 +821,7 @@ app.post("/otp/verify", async (req, res) => {
     meta: { redirect: redirectUrl },
   });
 
-  if (!redirectUrl) {
-    return res.status(400).send("missing base_grant_url");
-  }
-
-  // Redirect client browser to Meraki grant endpoint
+  if (!redirectUrl) return res.status(400).send("missing base_grant_url");
   return res.redirect(302, redirectUrl);
 });
 
@@ -862,8 +829,8 @@ app.post("/otp/verify", async (req, res) => {
 app.get("/admin/logs", requireAdmin, async (req, res) => {
   try {
     if (!dbEnabled) return res.status(503).send("db not configured");
-
     const limit = Math.min(parseInt(req.query.limit || "200", 10), 1000);
+
     const rows = await qRows(`
       SELECT id, created_at, event, first_name, last_name, phone, client_mac, client_ip, marker, kvkk_version
       FROM access_logs
@@ -882,7 +849,7 @@ th,td{padding:9px 10px;border-bottom:1px solid #23233a;font-size:13px}
 th{background:#15152c;text-align:left}
 tr:hover td{background:#141428}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-.btn{display:inline-block;padding:6px 10px;border:1px solid #2b2b4a;border-radius:8px;text-decoration:none}
+.btn{display:inline-block;padding:6px 10px;border:1px solid #2b2b4a;border-radius:8px;text-decoration:none;color:#eaeaf2}
 </style>
 </head>
 <body>
