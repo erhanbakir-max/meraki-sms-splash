@@ -1,779 +1,1124 @@
-'use strict';
+/**
+ * server.js — Meraki Splash + OTP(screen) + KVKK + 5651 log + Admin UI + “imzalama”(hash-chain placeholder)
+ *
+ * ✅ DB kolon tipleri: TEXT olacak şekilde tasarlandı (client_ip TEXT)
+ * ✅ Admin: /admin/logs  (Basic Auth: ADMIN_USER / ADMIN_PASS)
+ * ✅ 5651 için: kayıtlar Postgres’te, zincir hash ile “değiştirilemezlik” kanıtı (placeholder)
+ *
+ * Railway env (öneri):
+ * - PORT=8080 (Railway otomatik)
+ * - DATABASE_URL = ${{MerakiPostgres.DATABASE_URL}}
+ * - REDIS_URL / REDIS_PUBLIC_URL (opsiyonel)
+ * - OTP_MODE=screen
+ * - OTP_TTL_SECONDS=180
+ * - KVKK_VERSION=2026-02-12-placeholder
+ * - ADMIN_USER=...
+ * - ADMIN_PASS=...
+ * - SIGNING_SECRET=... (uzun random)
+ */
 
-const express = require('express');
-const crypto = require('crypto');
-const { Pool } = require('pg');
+const express = require("express");
+const crypto = require("crypto");
+const { Pool } = require("pg");
 
-let redisCreateClient = null;
-try { ({ createClient: redisCreateClient } = require('redis')); } catch (_) {}
+let Redis = null;
+let redis = null;
+try {
+  Redis = require("ioredis");
+} catch (_) {
+  // ignore
+}
 
+// -------------------- ENV --------------------
+const PORT = Number(process.env.PORT || 8080);
+const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen | sms (sms'i sonra)
+const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 180);
+
+const KVKK_VERSION = process.env.KVKK_VERSION || "placeholder";
+const ADMIN_USER = process.env.ADMIN_USER || "";
+const ADMIN_PASS = process.env.ADMIN_PASS || "";
+const SIGNING_SECRET = process.env.SIGNING_SECRET || "CHANGE_ME_SIGNING_SECRET";
+
+const RL_MAC_SECONDS = Number(process.env.RL_MAC_SECONDS || 30);
+const RL_PHONE_SECONDS = Number(process.env.RL_PHONE_SECONDS || 60);
+const MAX_WRONG_ATTEMPTS = Number(process.env.MAX_WRONG_ATTEMPTS || 5);
+const LOCK_SECONDS = Number(process.env.LOCK_SECONDS || 600);
+
+// DB
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+
+// Redis
+const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || "";
+if (Redis && REDIS_URL) {
+  redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2, enableReadyCheck: true });
+}
+
+function log(...args) {
+  console.log(...args);
+}
+
+// -------------------- APP --------------------
 const app = express();
-app.set('trust proxy', true);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-/* =======================
- * ENV
- * ======================= */
-const ENV = {
-  PORT: Number(process.env.PORT || 8080),
+// -------------------- HELPERS --------------------
+function nowIso() {
+  return new Date().toISOString();
+}
 
-  OTP_MODE: (process.env.OTP_MODE || 'screen').toLowerCase(),
-  OTP_TTL_SECONDS: Number(process.env.OTP_TTL_SECONDS || 180),
+function safeText(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
 
-  MAX_WRONG_ATTEMPTS: Number(process.env.MAX_WRONG_ATTEMPTS || 5),
-  LOCK_SECONDS: Number(process.env.LOCK_SECONDS || 600),
+function normalizePhone(raw) {
+  const s = (raw || "").toString().trim();
+  if (!s) return null;
+  // sadece rakam ve + kalsın
+  let t = s.replace(/[^\d+]/g, "");
+  // 0xxxxxxxxxx => +90xxxxxxxxxx
+  if (/^0\d{10}$/.test(t)) t = "+9" + t; // 0 -> +90 (0xxxxxxxxxx => +90xxxxxxxxxx)
+  if (/^\+?90\d{10}$/.test(t) && !t.startsWith("+")) t = "+" + t;
+  return t;
+}
 
-  RL_MAC_SECONDS: Number(process.env.RL_MAC_SECONDS || 30),
-  RL_PHONE_SECONDS: Number(process.env.RL_PHONE_SECONDS || 60),
+function getPublicIp(req) {
+  // Railway/Proxy arkasında: x-forwarded-for
+  const xf = req.headers["x-forwarded-for"];
+  if (xf) return String(xf).split(",")[0].trim();
+  return req.socket?.remoteAddress || null;
+}
 
-  KVKK_VERSION: process.env.KVKK_VERSION || '2026-02-12-placeholder',
-
-  BRAND_NAME: process.env.BRAND_NAME || 'Guest Wi-Fi',
-  COMPANY_LOGO_URL: process.env.COMPANY_LOGO_URL || '',
-
-  REDIS_URL: process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || '',
-  DATABASE_URL: process.env.DATABASE_URL || '',
-
-  PUBLIC_IP_REFRESH_SECONDS: Number(process.env.PUBLIC_IP_REFRESH_SECONDS || 3600),
-
-  // Admin
-  ADMIN_USER: process.env.ADMIN_USER || '',
-  ADMIN_PASS: process.env.ADMIN_PASS || '',
-};
-
-console.log('ENV:', {
-  OTP_MODE: ENV.OTP_MODE,
-  OTP_TTL_SECONDS: ENV.OTP_TTL_SECONDS,
-  RL_MAC_SECONDS: ENV.RL_MAC_SECONDS,
-  RL_PHONE_SECONDS: ENV.RL_PHONE_SECONDS,
-  MAX_WRONG_ATTEMPTS: ENV.MAX_WRONG_ATTEMPTS,
-  LOCK_SECONDS: ENV.LOCK_SECONDS,
-  KVKK_VERSION: ENV.KVKK_VERSION,
-  ADMIN_USER_SET: !!ENV.ADMIN_USER,
-  ADMIN_PASS_SET: !!ENV.ADMIN_PASS,
-});
-
-/* =======================
- * REDIS
- * ======================= */
-let redis = null;
-let redisReady = false;
-
-async function initRedis() {
-  if (!ENV.REDIS_URL || !redisCreateClient) {
-    console.log('REDIS: not configured. (Sessions will break across requests.)');
-    return;
+function basicAuth(req, res, next) {
+  if (!ADMIN_USER || !ADMIN_PASS) {
+    return res.status(500).send("Admin credentials are not set (ADMIN_USER/ADMIN_PASS).");
   }
-  redis = redisCreateClient({ url: ENV.REDIS_URL });
-  redis.on('error', (e) => console.error('REDIS ERROR:', e?.message || e));
-  await redis.connect();
-  redisReady = true;
-  console.log('REDIS: connected');
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Basic ")) {
+    res.set("WWW-Authenticate", 'Basic realm="admin"');
+    return res.status(401).send("Auth required");
+  }
+  const decoded = Buffer.from(h.slice(6), "base64").toString("utf8");
+  const [u, p] = decoded.split(":");
+  if (u === ADMIN_USER && p === ADMIN_PASS) return next();
+  res.set("WWW-Authenticate", 'Basic realm="admin"');
+  return res.status(401).send("Invalid credentials");
 }
 
-async function kvSet(key, obj, ttlSeconds) {
-  if (!redisReady) return;
-  await redis.set(key, JSON.stringify(obj), { EX: ttlSeconds });
-}
-async function kvGet(key) {
-  if (!redisReady) return null;
-  const v = await redis.get(key);
-  return v ? JSON.parse(v) : null;
-}
-async function kvDel(key) {
-  if (!redisReady) return;
-  await redis.del(key);
-}
-async function kvSetNX(key, value, ttlSeconds) {
-  if (!redisReady) return false;
-  const ok = await redis.set(key, value, { NX: true, EX: ttlSeconds });
-  return ok === 'OK';
+function hmacHex(secret, data) {
+  return crypto.createHmac("sha256", secret).update(data, "utf8").digest("hex");
 }
 
-function hashShort(s) {
-  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 24);
+function canonicalRowForHash(row) {
+  // Stabil, sıralı, JSONB de stabil stringify
+  const stableMeta = row.meta ? JSON.stringify(row.meta) : "";
+  return [
+    row.created_at || "",
+    row.event || "",
+    row.first_name || "",
+    row.last_name || "",
+    row.phone || "",
+    String(row.kvkk_accepted ?? ""),
+    row.kvkk_version || "",
+    row.client_mac || "",
+    row.client_ip || "",
+    row.ssid || "",
+    row.ap_name || "",
+    row.base_grant_url || "",
+    row.continue_url || "",
+    row.node_mac || "",
+    row.node_id || "",
+    row.gateway_id || "",
+    row.public_ip || "",
+    row.user_agent || "",
+    stableMeta,
+    row.prev_hash || "",
+  ].join("|");
 }
-function sessKey(mac) { return `sess:${hashShort(mac)}`; }
-function rlMacKey(mac) { return `rl:mac:${hashShort(mac)}`; }
-function rlPhoneKey(phone) { return `rl:ph:${hashShort(phone)}`; }
-function lockKey(mac) { return `lock:${hashShort(mac)}`; }
 
-/* =======================
- * POSTGRES
- * ======================= */
-const pool = ENV.DATABASE_URL ? new Pool({ connectionString: ENV.DATABASE_URL }) : null;
-
-async function initDatabase() {
+// -------------------- DB INIT --------------------
+async function dbInit() {
   if (!pool) {
-    console.log('DATABASE: not configured.');
+    log("DATABASE: not configured (DATABASE_URL missing).");
     return;
   }
-  await pool.query('SELECT 1');
-  console.log('DATABASE: connected');
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS access_logs (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
       event TEXT NOT NULL,
+
+      first_name TEXT,
+      last_name TEXT,
+      phone TEXT,
+
+      kvkk_accepted BOOLEAN NOT NULL DEFAULT false,
+      kvkk_version TEXT,
+
       client_mac TEXT,
       client_ip TEXT,
+
       ssid TEXT,
       ap_name TEXT,
+
       base_grant_url TEXT,
       continue_url TEXT,
-      marker TEXT,
-      phone TEXT,
-      full_name TEXT,
-      kvkk_version TEXT,
-      meta JSONB
+
+      node_mac TEXT,
+      node_id TEXT,
+      gateway_id TEXT,
+
+      public_ip TEXT,
+      user_agent TEXT,
+
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+      prev_hash TEXT,
+      row_hash TEXT
     );
   `);
 
-  const alters = [
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_mac TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS client_ip TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS ssid TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS ap_name TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS base_grant_url TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS continue_url TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS marker TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS phone TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS full_name TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS kvkk_version TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS meta JSONB;`,
-  ];
-  for (const sql of alters) { try { await pool.query(sql); } catch (_) {} }
+  // indexler (rapor/sorgu)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_phone ON access_logs(phone);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_mac ON access_logs(client_mac);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_ip ON access_logs(client_ip);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_access_logs_event ON access_logs(event);`);
 
-  console.log('DATABASE: table ready');
+  log("DATABASE: connected");
+  log("DATABASE: table ready");
 }
 
-async function logDb(event, data = {}) {
-  if (!pool) return;
-  try {
-    await pool.query(
-      `INSERT INTO access_logs(event, client_mac, client_ip, ssid, ap_name, base_grant_url, continue_url, marker, phone, full_name, kvkk_version, meta)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
-      [
-        event,
-        data.client_mac || null,
-        data.client_ip || null,
-        data.ssid || null,
-        data.ap_name || null,
-        data.base_grant_url || null,
-        data.continue_url || null,
-        data.marker || null,
-        data.phone || null,
-        data.full_name || null,
-        data.kvkk_version || ENV.KVKK_VERSION,
-        JSON.stringify(data.meta || {}),
-      ]
-    );
-  } catch (e) {
-    console.error('DB LOG ERROR:', e?.message || e);
-  }
-}
+// -------------------- OTP STORE (Redis or Memory fallback) --------------------
+const memOtp = new Map(); // key -> {otp, exp, wrong, lockedUntil, payload}
+const memRate = new Map(); // key -> {count, resetAt}
 
-/* =======================
- * Public IP (cached)
- * ======================= */
-let cachedPublicIp = '';
-let cachedPublicIpAt = 0;
+function rateKeyMac(mac) { return `rl:mac:${mac || "unknown"}`; }
+function rateKeyPhone(phone) { return `rl:ph:${phone || "unknown"}`; }
 
-async function fetchPublicIp() {
-  try {
-    const r = await fetch('https://ifconfig.me/ip', { method: 'GET' });
-    const t = (await r.text()).trim();
-    if (t && t.length < 64) return t;
-  } catch (_) {}
-  return '';
-}
-
-async function getPublicIpCached() {
+function rateAllow(key, windowSeconds) {
   const now = Date.now();
-  if (cachedPublicIp && (now - cachedPublicIpAt) < ENV.PUBLIC_IP_REFRESH_SECONDS * 1000) {
-    return cachedPublicIp;
+  const item = memRate.get(key);
+  if (!item || item.resetAt <= now) {
+    memRate.set(key, { count: 1, resetAt: now + windowSeconds * 1000 });
+    return true;
   }
-  const ip = await fetchPublicIp();
-  if (ip) {
-    cachedPublicIp = ip;
-    cachedPublicIpAt = now;
-    console.log('PUBLIC_IP:', cachedPublicIp);
+  if (item.count >= 20) return false; // basit limit
+  item.count += 1;
+  return true;
+}
+
+async function otpSet(marker, obj) {
+  const key = `otp:${marker}`;
+  const payload = JSON.stringify(obj);
+  if (redis) {
+    await redis.set(key, payload, "EX", OTP_TTL_SECONDS);
+    return;
   }
-  return cachedPublicIp || '';
+  memOtp.set(key, obj);
+  setTimeout(() => memOtp.delete(key), OTP_TTL_SECONDS * 1000).unref?.();
 }
 
-/* =======================
- * Helpers
- * ======================= */
-function safeStr(x, max = 1600) {
-  if (x == null) return '';
-  const s = String(x);
-  return s.length > max ? s.slice(0, max) : s;
+async function otpGet(marker) {
+  const key = `otp:${marker}`;
+  if (redis) {
+    const v = await redis.get(key);
+    return v ? JSON.parse(v) : null;
+  }
+  return memOtp.get(key) || null;
 }
 
-function getClientIp(req, q) {
-  const xf = req.headers['x-forwarded-for'];
-  const fromHeader = (typeof xf === 'string' && xf.length) ? xf.split(',')[0].trim() : '';
-  return safeStr(q?.client_ip || fromHeader || req.ip || '');
+async function otpDel(marker) {
+  const key = `otp:${marker}`;
+  if (redis) {
+    await redis.del(key);
+    return;
+  }
+  memOtp.delete(key);
 }
 
-function requestMeta(req) {
-  return {
-    user_agent: safeStr(req.headers['user-agent'] || '', 400),
-    accept_language: safeStr(req.headers['accept-language'] || '', 120),
-    referer: safeStr(req.headers['referer'] || '', 400),
-  };
+// -------------------- LOG INSERT (hash-chain) --------------------
+async function getLastRowHash() {
+  if (!pool) return null;
+  const r = await pool.query(`SELECT row_hash FROM access_logs ORDER BY id DESC LIMIT 1;`);
+  return r.rows?.[0]?.row_hash || null;
 }
 
-function parseMeraki(req) {
-  const q = req.query || {};
-  return {
-    baseGrantUrl: safeStr(q.base_grant_url || ''),
-    continueUrl: safeStr(q.user_continue_url || q.continue_url || ''),
-    clientMac: safeStr(q.client_mac || '').toLowerCase(),
-    clientIp: getClientIp(req, q),
-    ssid: safeStr(q.ssid_name || q.ssid || ''),
-    apName: safeStr(q.ap_name || ''),
-    rawQuery: req.originalUrl.includes('?') ? req.originalUrl.split('?').slice(1).join('?') : ''
-  };
-}
+async function insertLog(row) {
+  if (!pool) return;
 
-function normalizePhoneTR(input) {
-  const digits = (input || '').replace(/[^\d]/g, '');
-  if (digits.length === 11 && digits.startsWith('0') && digits[1] === '5') return digits.slice(1);
-  if (digits.length === 10 && digits.startsWith('5')) return digits;
-  if (digits.length === 12 && digits.startsWith('90') && digits[2] === '5') return digits.slice(2);
-  return digits;
-}
+  // prev_hash zinciri
+  const prev_hash = await getLastRowHash();
+  row.prev_hash = prev_hash || null;
 
-function randOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
+  // created_at DB default: now(), ama hash için “yakın” zaman sabitleyelim
+  row.created_at = nowIso();
 
-/* =======================
- * UI
- * ======================= */
-function kvkkPlaceholderHtml() {
-  return `
-  <strong>KVKK Aydınlatma Metni (Placeholder)</strong><br/>
-  Bu metin şimdilik örnektir. Gerçek metin daha sonra eklenecek.<br/><br/>
-  İşlenen veriler: Ad, Soyad, Telefon, MAC, IP, zaman damgaları.<br/>
-  Amaç: Misafir internet erişimi + 5651 loglama.<br/>
-  Versiyon: ${ENV.KVKK_VERSION}
+  // row_hash üret
+  const canon = canonicalRowForHash(row);
+  row.row_hash = hmacHex(SIGNING_SECRET, canon);
+
+  const q = `
+    INSERT INTO access_logs(
+      created_at, event,
+      first_name, last_name, phone,
+      kvkk_accepted, kvkk_version,
+      client_mac, client_ip,
+      ssid, ap_name,
+      base_grant_url, continue_url,
+      node_mac, node_id, gateway_id,
+      public_ip, user_agent,
+      meta,
+      prev_hash, row_hash
+    )
+    VALUES(
+      $1::timestamptz, $2,
+      $3, $4, $5,
+      $6::boolean, $7,
+      $8, $9,
+      $10, $11,
+      $12, $13,
+      $14, $15, $16,
+      $17, $18,
+      $19::jsonb,
+      $20, $21
+    )
   `;
+
+  const vals = [
+    row.created_at,
+    row.event,
+
+    row.first_name,
+    row.last_name,
+    row.phone,
+
+    !!row.kvkk_accepted,
+    row.kvkk_version,
+
+    row.client_mac,
+    row.client_ip,
+
+    row.ssid,
+    row.ap_name,
+
+    row.base_grant_url,
+    row.continue_url,
+
+    row.node_mac,
+    row.node_id,
+    row.gateway_id,
+
+    row.public_ip,
+    row.user_agent,
+
+    JSON.stringify(row.meta || {}),
+
+    row.prev_hash,
+    row.row_hash,
+  ];
+
+  await pool.query(q, vals);
 }
 
-function renderPage(title, inner) {
-  const logo = ENV.COMPANY_LOGO_URL
-    ? `<div style="text-align:center;margin-bottom:10px"><img src="${safeStr(ENV.COMPANY_LOGO_URL,500)}" style="max-height:64px;max-width:240px"/></div>`
-    : '';
-  return `<!doctype html><html lang="tr"><head>
-  <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>${title}</title>
-  <style>
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1220;color:#111;padding:22px}
-    .card{max-width:900px;margin:0 auto;background:#fff;border-radius:18px;padding:18px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
-    h2{margin:0 0 6px 0}
-    .mut{color:#6b7280;font-size:12px}
-    input,button{width:100%;padding:12px 12px;border-radius:12px;border:1px solid #d1d5db;font-size:14px}
-    button{border:0;background:#4f46e5;color:#fff;font-weight:800;cursor:pointer;margin-top:12px}
-    button:disabled{opacity:.7;cursor:not-allowed}
-    .otp{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:34px;letter-spacing:4px;font-weight:900;
-         text-align:center;padding:10px;border:1px dashed #9ca3af;border-radius:14px;background:#f9fafb;margin:10px 0}
-    .ok{background:#ecfdf5;border:1px solid #86efac;color:#166534;padding:10px;border-radius:12px;margin-top:10px}
-    .err{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:10px;border-radius:12px;margin-top:10px}
-    .row{display:flex;gap:10px}
-    .row>div{flex:1}
-    label{display:block;margin-top:10px;margin-bottom:6px;font-size:13px;color:#374151}
-    .kvkk{border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;max-height:170px;overflow:auto;font-size:12px;color:#4b5563}
-    .topline{display:flex;align-items:center;justify-content:space-between;gap:12px}
-    .badge{font-size:11px;color:#111;background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:6px 10px}
-    table{width:100%;border-collapse:collapse;margin-top:12px}
-    th,td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;font-size:13px;vertical-align:top}
-    th{background:#f9fafb}
-    .chip{display:inline-block;font-size:11px;padding:4px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#fff}
-    .right{float:right}
-    .search{display:flex;gap:10px;align-items:flex-end;margin-top:8px}
-    .search input{margin-top:0}
-  </style>
-  </head><body><div class="card">${logo}${inner}</div></body></html>`;
-}
+// -------------------- MERAKI PARAMS --------------------
+function extractMerakiParams(req) {
+  // Meraki query param isimleri farklı gelebilir; bu set iş görüyor
+  const q = req.query || {};
+  const base_grant_url = safeText(q.base_grant_url || q.baseGrantUrl || q.grant_url);
+  const continue_url = safeText(q.continue_url || q.user_continue_url || q.continue || q.redirect);
 
-/* =======================
- * Grant URL builder
- * ======================= */
-function buildGrantUrl(baseGrantUrl, rawQuery, continueUrl) {
-  const q = new URLSearchParams(rawQuery);
-  q.delete('user_continue_url');
-  q.delete('base_grant_url');
-  q.delete('duration');
-  if (continueUrl) q.set('continue_url', continueUrl);
-  const qs = q.toString();
-  if (!qs) return baseGrantUrl;
-  const glue = baseGrantUrl.includes('?') ? '&' : '?';
-  return baseGrantUrl + glue + qs;
-}
+  const client_mac = safeText(q.client_mac || q.clientMac);
+  const client_ip = safeText(q.client_ip || q.clientIp);
+  const node_mac = safeText(q.node_mac || q.nodeMac);
+  const node_id = safeText(q.node_id || q.nodeId);
+  const gateway_id = safeText(q.gateway_id || q.gatewayId);
+  const ssid = safeText(q.ssid);
+  const ap_name = safeText(q.ap_name || q.apName);
 
-/* =======================
- * Basic Auth (Admin)
- * ======================= */
-function constantTimeEq(a, b) {
-  const aa = Buffer.from(String(a || ''));
-  const bb = Buffer.from(String(b || ''));
-  if (aa.length !== bb.length) return false;
-  return crypto.timingSafeEqual(aa, bb);
-}
-
-function requireAdmin(req, res, next) {
-  if (!ENV.ADMIN_USER || !ENV.ADMIN_PASS) {
-    return res.status(503).send('Admin is not configured. Set ADMIN_USER and ADMIN_PASS.');
-  }
-  const h = req.headers.authorization || '';
-  if (!h.startsWith('Basic ')) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="admin", charset="UTF-8"');
-    return res.status(401).send('Auth required');
-  }
-  const raw = Buffer.from(h.slice(6), 'base64').toString('utf8');
-  const idx = raw.indexOf(':');
-  const user = idx >= 0 ? raw.slice(0, idx) : raw;
-  const pass = idx >= 0 ? raw.slice(idx + 1) : '';
-  if (!constantTimeEq(user, ENV.ADMIN_USER) || !constantTimeEq(pass, ENV.ADMIN_PASS)) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="admin", charset="UTF-8"');
-    return res.status(401).send('Invalid credentials');
-  }
-  next();
-}
-
-/* =======================
- * Admin Queries
- * ======================= */
-function escHtml(s) {
-  return String(s ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
-function fmtJson(v) {
-  try { return escHtml(JSON.stringify(v ?? {}, null, 2)); } catch { return ''; }
-}
-
-async function qRows(sql, params) {
-  if (!pool) return [];
-  const r = await pool.query(sql, params);
-  return r.rows || [];
-}
-
-/* =======================
- * Routes
- * ======================= */
-app.get('/health', async (req, res) => {
-  const publicIp = await getPublicIpCached();
-  res.json({ ok: true, public_ip: publicIp || null });
-});
-
-app.get('/', async (req, res) => {
-  const m = parseMeraki(req);
-  const metaReq = requestMeta(req);
-  const publicIp = await getPublicIpCached();
-
-  console.log('SPLASH_OPEN', {
-    hasBaseGrant: !!m.baseGrantUrl,
-    hasContinue: !!m.continueUrl,
-    hasClientMac: !!m.clientMac,
-    mode: ENV.OTP_MODE
-  });
-
-  if (!m.baseGrantUrl || !m.clientMac) {
-    await logDb('SPLASH_BAD_REQUEST', { meta: { missing: true, q: req.query || {}, ...metaReq, public_ip: publicIp } });
-    return res.status(400).send(renderPage('Hata', `
-      <h2>Eksik parametre</h2>
-      <div class="err">base_grant_url / client_mac yok. Bu sayfa Meraki Splash üzerinden açılmalı.</div>
-    `));
-  }
-
-  const sk = sessKey(m.clientMac);
-  await kvSet(sk, { meraki: m, otp: null, user: null }, ENV.OTP_TTL_SECONDS);
-
-  await logDb('SPLASH_OPEN', {
-    client_mac: m.clientMac,
-    client_ip: m.clientIp,
-    ssid: m.ssid,
-    ap_name: m.apName,
-    base_grant_url: m.baseGrantUrl,
-    continue_url: m.continueUrl,
-    meta: { rawQuery_len: m.rawQuery.length, ...metaReq, public_ip: publicIp }
-  });
-
-  res.send(renderPage('Giriş', `
-    <div class="topline">
-      <div>
-        <h2>${escHtml(ENV.BRAND_NAME)}</h2>
-        <div class="mut">Misafir internet erişimi</div>
-      </div>
-      <div class="badge">KVKK ${escHtml(ENV.KVKK_VERSION)}</div>
-    </div>
-
-    <form method="POST" action="/start" style="margin-top:14px" onsubmit="document.getElementById('btn').disabled=true;">
-      <input type="hidden" name="client_mac" value="${escHtml(m.clientMac)}"/>
-
-      <div class="row">
-        <div>
-          <label>Ad</label>
-          <input name="first_name" required maxlength="50" autocomplete="given-name"/>
-        </div>
-        <div>
-          <label>Soyad</label>
-          <input name="last_name" required maxlength="50" autocomplete="family-name"/>
-        </div>
-      </div>
-
-      <label>Cep telefonu</label>
-      <input name="phone" required maxlength="25" placeholder="05xx..." inputmode="tel" autocomplete="tel"/>
-
-      <label>KVKK</label>
-      <div class="kvkk">${kvkkPlaceholderHtml()}</div>
-
-      <label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px">
-        <input type="checkbox" name="kvkk_accepted" value="1" required style="width:18px;height:18px;margin-top:3px"/>
-        <span class="mut" style="font-size:13px;color:#374151">KVKK metnini okudum ve kabul ediyorum.</span>
-      </label>
-
-      <button id="btn" type="submit">Devam et</button>
-      <div class="mut" style="margin-top:8px">Doğrulama kodu şimdilik ekranda gösterilir (SMS sonra).</div>
-    </form>
-  `));
-});
-
-app.post('/start', async (req, res) => {
-  const client_mac = safeStr(req.body.client_mac, 64).toLowerCase();
-  const first_name = safeStr(req.body.first_name, 50).trim();
-  const last_name = safeStr(req.body.last_name, 50).trim();
-  const phone_raw = safeStr(req.body.phone, 25).trim();
-  const phone = normalizePhoneTR(phone_raw);
-  const kvkk_accepted = req.body.kvkk_accepted === '1';
-
-  const sk = sessKey(client_mac);
-  const sess = await kvGet(sk);
-  if (!sess?.meraki?.baseGrantUrl) {
-    await logDb('START_NO_SESSION', { client_mac, meta: { reason: 'no_session' } });
-    return res.status(400).send(renderPage('Hata', `<h2>Oturum bulunamadı</h2><div class="err">Lütfen tekrar deneyin.</div>`));
-  }
-
-  const metaReq = requestMeta(req);
-  const publicIp = await getPublicIpCached();
-
-  const locked = await kvGet(lockKey(client_mac));
-  if (locked) {
-    return res.status(429).send(renderPage('Kilitli', `<h2>Çok fazla deneme</h2><div class="err">Lütfen biraz bekleyip tekrar deneyin.</div>`));
-  }
-
-  const macOk = await kvSetNX(rlMacKey(client_mac), '1', ENV.RL_MAC_SECONDS);
-  const phOk = await kvSetNX(rlPhoneKey(phone || phone_raw), '1', ENV.RL_PHONE_SECONDS);
-  if (!macOk || !phOk) {
-    await logDb('OTP_RATE_LIMIT', {
-      client_mac,
-      client_ip: sess.meraki.clientIp,
-      ssid: sess.meraki.ssid,
-      ap_name: sess.meraki.apName,
-      base_grant_url: sess.meraki.baseGrantUrl,
-      continue_url: sess.meraki.continueUrl,
-      meta: { by: !macOk ? 'mac' : 'phone', ...metaReq, public_ip: publicIp }
-    });
-    return res.status(429).send(renderPage('Yavaş', `
-      <h2>Çok hızlı deneme</h2>
-      <div class="err">Lütfen ${!macOk ? ENV.RL_MAC_SECONDS : ENV.RL_PHONE_SECONDS} saniye bekleyip tekrar deneyin.</div>
-    `));
-  }
-
-  const otp = randOtp();
-  const marker = String(Math.floor(100000 + Math.random() * 900000));
-  const full_name = `${first_name} ${last_name}`.trim();
-
-  sess.user = { first_name, last_name, full_name, phone, phone_raw, kvkk_accepted: !!kvkk_accepted, kvkk_version: ENV.KVKK_VERSION };
-  sess.otp = { value: otp, marker, wrong: 0, expiresAt: Date.now() + ENV.OTP_TTL_SECONDS * 1000 };
-
-  await kvSet(sk, sess, ENV.OTP_TTL_SECONDS);
-
-  console.log('OTP_CREATED', { marker, last4: (phone || phone_raw).slice(-4), client_mac });
-
-  await logDb('OTP_CREATED', {
+  return {
+    base_grant_url,
+    continue_url,
     client_mac,
-    client_ip: sess.meraki.clientIp,
-    ssid: sess.meraki.ssid,
-    ap_name: sess.meraki.apName,
-    base_grant_url: sess.meraki.baseGrantUrl,
-    continue_url: sess.meraki.continueUrl,
-    marker,
-    phone,
-    full_name,
-    kvkk_version: ENV.KVKK_VERSION,
-    meta: { ...metaReq, public_ip: publicIp }
+    client_ip,
+    node_mac,
+    node_id,
+    gateway_id,
+    ssid,
+    ap_name,
+  };
+}
+
+function buildGrantRedirectUrl(params) {
+  // En sağlıklısı: base_grant_url’yi redirect etmek, gerekli query'leri (continue_url/duration) eklemek
+  // base_grant_url örnek: https://eu.network-auth.com/splash/XXXXX/grant
+  if (!params.base_grant_url) return null;
+
+  const u = new URL(params.base_grant_url);
+  // Meraki bazen gerekli alanları base_grant_url içinde taşır; biz ek olarak güvenli şekilde ekleyelim
+  if (params.gateway_id) u.searchParams.set("gateway_id", params.gateway_id);
+  if (params.node_id) u.searchParams.set("node_id", params.node_id);
+  if (params.client_ip) u.searchParams.set("client_ip", params.client_ip);
+  if (params.client_mac) u.searchParams.set("client_mac", params.client_mac);
+  if (params.node_mac) u.searchParams.set("node_mac", params.node_mac);
+  if (params.continue_url) u.searchParams.set("continue_url", params.continue_url);
+
+  // süre (opsiyonel)
+  u.searchParams.set("duration", "3600");
+  return u.toString();
+}
+
+// -------------------- UI (SPLASH) --------------------
+function splashHtml(ctx) {
+  // KVKK placeholder
+  const kvkkText = `
+    <div class="kvkk-box">
+      <h3>KVKK Aydınlatma Metni (Placeholder)</h3>
+      <p>Buraya firmanızın KVKK aydınlatma metni HTML olarak eklenecek.</p>
+      <p><b>Versiyon:</b> ${ctx.kvkkVersion}</p>
+    </div>
+  `;
+
+  // Hidden fields: meraki params + marker
+  const hidden = Object.entries(ctx.hidden || {})
+    .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || "").replace(/"/g, "&quot;")}" />`)
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Misafir Wi-Fi Giriş</title>
+  <style>
+    :root{--bg:#0b0f1a;--card:#121a2a;--text:#eaf0ff;--muted:#a7b3d6;--accent:#6e5cff;--danger:#ff4d4d;}
+    body{margin:0;background:radial-gradient(1200px 800px at 70% 10%, #1a2450 0%, var(--bg) 55%);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
+    .card{width:min(520px,100%);background:rgba(18,26,42,.92);border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,.35);overflow:hidden}
+    .head{padding:22px 22px 10px;display:flex;gap:14px;align-items:center}
+    .logo{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#20e3b2);display:flex;align-items:center;justify-content:center;font-weight:800;color:#0b0f1a}
+    .title{font-size:18px;font-weight:800;line-height:1.2}
+    .sub{color:var(--muted);font-size:13px;margin-top:3px}
+    .content{padding:0 22px 22px}
+    label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
+    input[type="text"], input[type="tel"]{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);outline:none}
+    input:focus{border-color:rgba(110,92,255,.65);box-shadow:0 0 0 4px rgba(110,92,255,.18)}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .kvkk{margin-top:12px;display:flex;gap:10px;align-items:flex-start}
+    .kvkk input{margin-top:4px}
+    .kvkk small{color:var(--muted);display:block;margin-top:6px}
+    .kvkk-box{margin-top:10px;padding:12px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08)}
+    .kvkk-box h3{margin:0 0 6px;font-size:13px}
+    .kvkk-box p{margin:6px 0;color:var(--muted);font-size:12px;line-height:1.35}
+    .actions{margin-top:16px;display:flex;gap:10px}
+    button{flex:1;padding:12px;border-radius:12px;border:none;background:linear-gradient(135deg,var(--accent),#20e3b2);color:#0b0f1a;font-weight:900;cursor:pointer}
+    .ghost{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text)}
+    .err{margin-top:12px;color:var(--danger);font-size:13px}
+    .meta{margin-top:12px;color:rgba(167,179,214,.8);font-size:11px}
+    .chip{display:inline-block;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);margin-right:6px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="head">
+      <div class="logo">Wi</div>
+      <div>
+        <div class="title">Misafir İnternet Girişi</div>
+        <div class="sub">Ad-Soyad, telefon ve KVKK onayı ile giriş.</div>
+      </div>
+    </div>
+    <div class="content">
+      ${ctx.error ? `<div class="err">${ctx.error}</div>` : ""}
+      <form method="POST" action="/otp/create">
+        ${hidden}
+        <div class="row">
+          <div>
+            <label>Ad</label>
+            <input name="first_name" type="text" required maxlength="80" placeholder="Ad" />
+          </div>
+          <div>
+            <label>Soyad</label>
+            <input name="last_name" type="text" required maxlength="80" placeholder="Soyad" />
+          </div>
+        </div>
+
+        <label>Cep Telefonu</label>
+        <input name="phone" type="tel" required maxlength="20" placeholder="0 5xx xxx xx xx" />
+
+        <div class="kvkk">
+          <input type="checkbox" name="kvkk_accepted" value="true" required />
+          <div>
+            <div><b>KVKK Aydınlatma Metni</b> ve <b>Açık Rıza</b> koşullarını okudum, kabul ediyorum.</div>
+            <small>Bu metin daha sonra gerçek içerikle değiştirilecek.</small>
+          </div>
+        </div>
+
+        ${kvkkText}
+
+        <div class="actions">
+          <button type="submit">Devam Et</button>
+          <button type="button" class="ghost" onclick="location.reload()">Yenile</button>
+        </div>
+
+        <div class="meta">
+          <span class="chip">OTP: ${OTP_MODE}</span>
+          <span class="chip">KVKK: ${ctx.kvkkVersion}</span>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
+function otpHtml(ctx) {
+  const hidden = Object.entries(ctx.hidden || {})
+    .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || "").replace(/"/g, "&quot;")}" />`)
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>OTP Doğrulama</title>
+  <style>
+    :root{--bg:#0b0f1a;--card:#121a2a;--text:#eaf0ff;--muted:#a7b3d6;--accent:#6e5cff;--danger:#ff4d4d;}
+    body{margin:0;background:radial-gradient(1200px 800px at 70% 10%, #1a2450 0%, var(--bg) 55%);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    .wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
+    .card{width:min(520px,100%);background:rgba(18,26,42,.92);border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,.35);overflow:hidden}
+    .head{padding:22px 22px 10px}
+    .title{font-size:18px;font-weight:900}
+    .sub{color:var(--muted);font-size:13px;margin-top:4px}
+    .content{padding:0 22px 22px}
+    label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
+    input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);outline:none}
+    input:focus{border-color:rgba(110,92,255,.65);box-shadow:0 0 0 4px rgba(110,92,255,.18)}
+    .actions{margin-top:16px;display:flex;gap:10px}
+    button{flex:1;padding:12px;border-radius:12px;border:none;background:linear-gradient(135deg,var(--accent),#20e3b2);color:#0b0f1a;font-weight:900;cursor:pointer}
+    .ghost{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text)}
+    .err{margin-top:12px;color:var(--danger);font-size:13px}
+    .codebox{margin-top:10px;padding:12px;border-radius:12px;background:rgba(255,255,255,.03);border:1px dashed rgba(255,255,255,.2);color:var(--muted);font-size:12px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="head">
+      <div class="title">Doğrulama Kodu</div>
+      <div class="sub">Telefonuna gelen kodu gir (şimdilik ekranda gösteriyoruz).</div>
+    </div>
+    <div class="content">
+      ${ctx.error ? `<div class="err">${ctx.error}</div>` : ""}
+      ${ctx.debugCode ? `<div class="codebox"><b>DEBUG (screen mode):</b> Kod = <b>${ctx.debugCode}</b></div>` : ""}
+      <form method="POST" action="/otp/verify">
+        ${hidden}
+        <label>OTP</label>
+        <input name="otp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required placeholder="6 haneli kod" />
+        <div class="actions">
+          <button type="submit">Bağlan</button>
+          <button type="button" class="ghost" onclick="history.back()">Geri</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
+// -------------------- ROUTES --------------------
+
+// health
+app.get("/healthz", (req, res) => {
+  res.json({
+    ok: true,
+    ts: nowIso(),
+    redis: !!redis,
+    db: !!pool,
+    otp_mode: OTP_MODE,
+    kvkk_version: KVKK_VERSION,
+    admin_user_set: !!ADMIN_USER,
   });
-
-  res.send(renderPage('OTP', `
-    <h2>Doğrulama</h2>
-    <div class="mut">SMS kapalı. Kod ekranda gösteriliyor.</div>
-    <div class="otp">${escHtml(otp)}</div>
-
-    <form method="POST" action="/verify" onsubmit="document.getElementById('btn2').disabled=true;">
-      <input type="hidden" name="client_mac" value="${escHtml(client_mac)}"/>
-      <label>Kodu girin</label>
-      <input name="otp" required inputmode="numeric" maxlength="10" autocomplete="one-time-code"/>
-      <button id="btn2" type="submit">Doğrula ve Bağlan</button>
-    </form>
-    <div class="mut" style="margin-top:10px">Kod süresi: ${ENV.OTP_TTL_SECONDS} saniye.</div>
-  `));
 });
 
-app.post('/verify', async (req, res) => {
-  const client_mac = safeStr(req.body.client_mac, 64).toLowerCase();
-  const otp_in = safeStr(req.body.otp, 10).trim();
+// Splash entry
+app.get(["/", "/splash"], async (req, res) => {
+  const p = extractMerakiParams(req);
 
-  const sk = sessKey(client_mac);
-  const sess = await kvGet(sk);
-  if (!sess?.otp?.value || !sess?.meraki?.baseGrantUrl) {
-    await logDb('VERIFY_NO_SESSION', { client_mac, meta: { reason: 'no_session_or_otp' } });
-    return res.status(400).send(renderPage('Hata', `<h2>Oturum yok</h2><div class="err">Lütfen tekrar başlayın.</div>`));
+  log("SPLASH_OPEN", {
+    hasBaseGrant: !!p.base_grant_url,
+    hasContinue: !!p.continue_url,
+    hasClientMac: !!p.client_mac,
+    mode: OTP_MODE,
+  });
+
+  if (!p.base_grant_url) {
+    // bazen Meraki paramları yokken direkt açılabilir; yine de UI gösterelim
   }
 
-  const metaReq = requestMeta(req);
-  const publicIp = await getPublicIpCached();
+  // UI’da hidden olarak taşıyalım
+  const hidden = {
+    base_grant_url: p.base_grant_url || "",
+    continue_url: p.continue_url || "",
+    client_mac: p.client_mac || "",
+    client_ip: p.client_ip || "",
+    node_mac: p.node_mac || "",
+    node_id: p.node_id || "",
+    gateway_id: p.gateway_id || "",
+    ssid: p.ssid || "",
+    ap_name: p.ap_name || "",
+  };
 
-  if (Date.now() > sess.otp.expiresAt) {
-    await logDb('OTP_EXPIRED', { client_mac, client_ip: sess.meraki.clientIp, marker: sess.otp.marker, meta: { ...metaReq, public_ip: publicIp } });
-    await kvDel(sk);
-    return res.status(400).send(renderPage('Süre doldu', `<h2>Kod süresi doldu</h2><div class="err">Lütfen tekrar deneyin.</div>`));
-  }
+  res.status(200).send(
+    splashHtml({
+      kvkkVersion: KVKK_VERSION,
+      hidden,
+      error: null,
+    })
+  );
+});
 
-  if (otp_in !== sess.otp.value) {
-    sess.otp.wrong = Number(sess.otp.wrong || 0) + 1;
-    await logDb('OTP_WRONG', { client_mac, client_ip: sess.meraki.clientIp, marker: sess.otp.marker, meta: { wrong: sess.otp.wrong, ...metaReq, public_ip: publicIp } });
+// Create OTP
+app.post("/otp/create", async (req, res) => {
+  try {
+    const first_name = safeText(req.body.first_name);
+    const last_name = safeText(req.body.last_name);
+    const phone = normalizePhone(req.body.phone);
+    const kvkk_accepted = req.body.kvkk_accepted === "true" || req.body.kvkk_accepted === true;
 
-    if (sess.otp.wrong >= ENV.MAX_WRONG_ATTEMPTS) {
-      await kvSet(lockKey(client_mac), { at: Date.now() }, ENV.LOCK_SECONDS);
-      await kvDel(sk);
-      return res.status(429).send(renderPage('Kilitli', `<h2>Çok fazla hatalı deneme</h2><div class="err">${ENV.LOCK_SECONDS} saniye kilitlendi.</div>`));
+    const p = {
+      base_grant_url: safeText(req.body.base_grant_url),
+      continue_url: safeText(req.body.continue_url),
+      client_mac: safeText(req.body.client_mac),
+      client_ip: safeText(req.body.client_ip),
+      node_mac: safeText(req.body.node_mac),
+      node_id: safeText(req.body.node_id),
+      gateway_id: safeText(req.body.gateway_id),
+      ssid: safeText(req.body.ssid),
+      ap_name: safeText(req.body.ap_name),
+    };
+
+    // Rate limit (basit)
+    if (p.client_mac && !rateAllow(rateKeyMac(p.client_mac), RL_MAC_SECONDS)) {
+      return res.status(429).send(otpHtml({ error: "Çok fazla deneme. Lütfen biraz sonra tekrar deneyin.", hidden: {} }));
+    }
+    if (phone && !rateAllow(rateKeyPhone(phone), RL_PHONE_SECONDS)) {
+      return res.status(429).send(otpHtml({ error: "Çok fazla deneme. Lütfen biraz sonra tekrar deneyin.", hidden: {} }));
     }
 
-    await kvSet(sk, sess, Math.ceil((sess.otp.expiresAt - Date.now()) / 1000));
-    return res.status(401).send(renderPage('Hatalı', `
-      <h2>Hatalı kod</h2>
-      <div class="err">Tekrar deneyin. (${sess.otp.wrong}/${ENV.MAX_WRONG_ATTEMPTS})</div>
-      <form method="POST" action="/verify" onsubmit="document.getElementById('btn3').disabled=true;">
-        <input type="hidden" name="client_mac" value="${escHtml(client_mac)}"/>
-        <label>Kodu girin</label>
-        <input name="otp" required inputmode="numeric" maxlength="10" autocomplete="one-time-code"/>
-        <button id="btn3" type="submit">Tekrar Doğrula</button>
-      </form>
-    `));
+    if (!first_name || !last_name || !phone || !kvkk_accepted) {
+      return res.status(400).send(
+        splashHtml({
+          kvkkVersion: KVKK_VERSION,
+          hidden: { ...p },
+          error: "Lütfen ad/soyad/telefon ve KVKK onayını doldurun.",
+        })
+      );
+    }
+
+    // OTP üret
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const marker = String(Math.floor(100000 + Math.random() * 900000));
+
+    const payload = {
+      marker,
+      otp,
+      created_at: nowIso(),
+      wrong: 0,
+      locked_until: 0,
+      first_name,
+      last_name,
+      phone,
+      kvkk_accepted: true,
+      kvkk_version: KVKK_VERSION,
+      meraki: p,
+    };
+
+    await otpSet(marker, payload);
+
+    log("OTP_CREATED", { marker, last4: phone.slice(-4), client_mac: p.client_mac });
+
+    // 5651 log: OTP_CREATED
+    await insertLog({
+      event: "OTP_CREATED",
+      first_name,
+      last_name,
+      phone,
+      kvkk_accepted: true,
+      kvkk_version: KVKK_VERSION,
+      client_mac: p.client_mac,
+      client_ip: p.client_ip,
+      ssid: p.ssid,
+      ap_name: p.ap_name,
+      base_grant_url: p.base_grant_url,
+      continue_url: p.continue_url,
+      node_mac: p.node_mac,
+      node_id: p.node_id,
+      gateway_id: p.gateway_id,
+      public_ip: getPublicIp(req),
+      user_agent: safeText(req.headers["user-agent"]),
+      meta: { otp_mode: OTP_MODE },
+    }).catch((e) => log("DB LOG ERROR:", e?.message || e));
+
+    // screen mode: kodu ekranda göster (sms sonra)
+    const hidden = { marker };
+    res.status(200).send(
+      otpHtml({
+        hidden,
+        debugCode: OTP_MODE === "screen" ? otp : null,
+        error: null,
+      })
+    );
+  } catch (e) {
+    log("OTP_CREATE_ERR", e);
+    res.status(500).send("Server error");
   }
-
-  console.log('OTP_VERIFY_OK', { marker: sess.otp.marker, client_mac });
-
-  await logDb('OTP_VERIFIED', {
-    client_mac,
-    client_ip: sess.meraki.clientIp,
-    ssid: sess.meraki.ssid,
-    ap_name: sess.meraki.apName,
-    base_grant_url: sess.meraki.baseGrantUrl,
-    continue_url: sess.meraki.continueUrl,
-    marker: sess.otp.marker,
-    phone: sess.user?.phone,
-    full_name: sess.user?.full_name,
-    kvkk_version: ENV.KVKK_VERSION,
-    meta: { ...metaReq, public_ip: publicIp }
-  });
-
-  const grantUrl = buildGrantUrl(sess.meraki.baseGrantUrl, sess.meraki.rawQuery, sess.meraki.continueUrl);
-  console.log('GRANT_CLIENT_REDIRECT:', grantUrl);
-
-  await logDb('GRANT_CLIENT_REDIRECT', {
-    client_mac,
-    client_ip: sess.meraki.clientIp,
-    ssid: sess.meraki.ssid,
-    ap_name: sess.meraki.apName,
-    base_grant_url: sess.meraki.baseGrantUrl,
-    continue_url: sess.meraki.continueUrl,
-    marker: sess.otp.marker,
-    phone: sess.user?.phone,
-    full_name: sess.user?.full_name,
-    kvkk_version: ENV.KVKK_VERSION,
-    meta: { grantUrl, ...metaReq, public_ip: publicIp }
-  });
-
-  await kvDel(sk);
-
-  const cont = sess.meraki.continueUrl || 'http://example.com';
-
-  return res.status(200).send(renderPage('Bağlanıyor', `
-    <h2>Bağlanılıyor…</h2>
-    <div class="ok">İzin veriliyor (Meraki Grant).</div>
-    <div class="mut">Yönlendirme olmazsa 2 saniye içinde devam sayfasına geçeceğiz.</div>
-
-    <script>
-      window.location.href = ${JSON.stringify(grantUrl)};
-      setTimeout(() => { window.location.href = ${JSON.stringify(cont)}; }, 2000);
-    </script>
-  `));
 });
 
-/* =======================
- * ADMIN: /admin/logs
- * ======================= */
-app.get('/admin/logs', requireAdmin, async (req, res) => {
-  if (!pool) return res.status(500).send('DATABASE_URL not configured');
+// Verify OTP and grant
+app.post("/otp/verify", async (req, res) => {
+  try {
+    const marker = safeText(req.body.marker);
+    const otp = safeText(req.body.otp);
 
-  const mode = String(req.query.mode || 'last24');
-  const q = String(req.query.q || '').trim();
-  const limit = Math.min(500, Math.max(10, Number(req.query.limit || 200)));
+    if (!marker || !otp) return res.status(400).send("Missing marker/otp");
+
+    const obj = await otpGet(marker);
+    if (!obj) return res.status(400).send(otpHtml({ hidden: { marker }, error: "Kod süresi doldu. Baştan deneyin." }));
+
+    // lock / wrong attempts
+    const now = Date.now();
+    if (obj.locked_until && obj.locked_until > now) {
+      return res.status(429).send(otpHtml({ hidden: { marker }, error: "Çok fazla yanlış deneme. Biraz bekleyin." }));
+    }
+
+    if (String(obj.otp) !== String(otp)) {
+      obj.wrong = (obj.wrong || 0) + 1;
+      if (obj.wrong >= MAX_WRONG_ATTEMPTS) {
+        obj.locked_until = now + LOCK_SECONDS * 1000;
+      }
+      await otpSet(marker, obj);
+      return res.status(400).send(otpHtml({ hidden: { marker }, error: "Kod hatalı. Tekrar deneyin." }));
+    }
+
+    // OK
+    log("OTP_VERIFY_OK", { marker, client_mac: obj.meraki?.client_mac });
+
+    await insertLog({
+      event: "OTP_VERIFIED",
+      first_name: obj.first_name,
+      last_name: obj.last_name,
+      phone: obj.phone,
+      kvkk_accepted: true,
+      kvkk_version: obj.kvkk_version,
+      client_mac: obj.meraki?.client_mac,
+      client_ip: obj.meraki?.client_ip,
+      ssid: obj.meraki?.ssid,
+      ap_name: obj.meraki?.ap_name,
+      base_grant_url: obj.meraki?.base_grant_url,
+      continue_url: obj.meraki?.continue_url,
+      node_mac: obj.meraki?.node_mac,
+      node_id: obj.meraki?.node_id,
+      gateway_id: obj.meraki?.gateway_id,
+      public_ip: getPublicIp(req),
+      user_agent: safeText(req.headers["user-agent"]),
+      meta: { marker },
+    }).catch((e) => log("DB LOG ERROR:", e?.message || e));
+
+    const redirectUrl = buildGrantRedirectUrl(obj.meraki || {});
+    if (!redirectUrl) {
+      await otpDel(marker);
+      return res.status(200).send("OTP OK but base_grant_url missing.");
+    }
+
+    log("GRANT_CLIENT_REDIRECT:", redirectUrl);
+
+    await otpDel(marker);
+    return res.redirect(302, redirectUrl);
+  } catch (e) {
+    log("OTP_VERIFY_ERR", e);
+    res.status(500).send("Server error");
+  }
+});
+
+// -------------------- ADMIN UI --------------------
+function adminLayout(title, body) {
+  return `<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${title}</title>
+  <style>
+    :root{--bg:#0b0f1a;--card:#121a2a;--text:#eaf0ff;--muted:#a7b3d6;--accent:#6e5cff;--danger:#ff4d4d;}
+    body{margin:0;background:radial-gradient(1200px 800px at 70% 10%, #1a2450 0%, var(--bg) 55%);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+    .wrap{max-width:1200px;margin:0 auto;padding:22px}
+    .card{background:rgba(18,26,42,.92);border:1px solid rgba(255,255,255,.08);border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.35);padding:16px}
+    h1{margin:0 0 12px;font-size:18px}
+    .muted{color:var(--muted)}
+    table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+    th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.08);vertical-align:top}
+    th{color:rgba(167,179,214,.9);text-align:left;font-weight:800}
+    .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+    label{display:block;color:var(--muted);font-size:11px;margin-bottom:6px}
+    input,select{padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);outline:none}
+    a.btn, button.btn{display:inline-block;padding:10px 12px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#20e3b2);color:#0b0f1a;font-weight:900;border:none;text-decoration:none;cursor:pointer}
+    a.ghost{background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--text)}
+    .chip{display:inline-block;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);margin-right:6px}
+    .ok{color:#20e3b2;font-weight:900}
+    .bad{color:var(--danger);font-weight:900}
+    pre{white-space:pre-wrap;word-break:break-word;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);padding:10px;border-radius:12px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    ${body}
+    <div class="muted" style="margin-top:14px;font-size:11px">
+      <span class="chip">KVKK_VERSION: ${KVKK_VERSION}</span>
+      <span class="chip">OTP_MODE: ${OTP_MODE}</span>
+      <span class="chip">DB: ${pool ? "on" : "off"}</span>
+      <span class="chip">REDIS: ${redis ? "on" : "off"}</span>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// Query builder for admin logs
+async function fetchLogs(filters) {
+  if (!pool) return { rows: [], total: 0 };
 
   const where = [];
-  const params = [];
-  let idx = 1;
+  const vals = [];
+  let i = 1;
 
-  // time window
-  if (mode === 'last24') {
-    where.push(`created_at >= now() - interval '24 hours'`);
-  } else if (mode === 'last7d') {
-    where.push(`created_at >= now() - interval '7 days'`);
+  if (filters.sinceHours) {
+    where.push(`created_at >= now() - ($${i}::int || ' hours')::interval`);
+    vals.push(filters.sinceHours);
+    i++;
+  }
+  if (filters.phone) {
+    where.push(`phone ILIKE $${i}`);
+    vals.push(`%${filters.phone}%`);
+    i++;
+  }
+  if (filters.mac) {
+    where.push(`client_mac ILIKE $${i}`);
+    vals.push(`%${filters.mac}%`);
+    i++;
+  }
+  if (filters.ip) {
+    where.push(`client_ip ILIKE $${i}`);
+    vals.push(`%${filters.ip}%`);
+    i++;
+  }
+  if (filters.event) {
+    where.push(`event = $${i}`);
+    vals.push(filters.event);
+    i++;
   }
 
-  // search filters
-  if (q) {
-    // search in phone/mac/ip/marker/name
-    where.push(`(
-      COALESCE(phone,'') ILIKE $${idx}
-      OR COALESCE(client_mac,'') ILIKE $${idx}
-      OR COALESCE(client_ip,'') ILIKE $${idx}
-      OR COALESCE(marker,'') ILIKE $${idx}
-      OR COALESCE(full_name,'') ILIKE $${idx}
-    )`);
-    params.push(`%${q}%`);
-    idx += 1;
+  const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const limit = Math.min(Number(filters.limit || 200), 2000);
+  const offset = Math.max(Number(filters.offset || 0), 0);
+
+  const totalQ = await pool.query(`SELECT COUNT(*)::bigint AS c FROM access_logs ${w};`, vals);
+  const q = await pool.query(
+    `SELECT * FROM access_logs ${w} ORDER BY id DESC LIMIT ${limit} OFFSET ${offset};`,
+    vals
+  );
+  return { rows: q.rows || [], total: Number(totalQ.rows?.[0]?.c || 0) };
+}
+
+// Admin logs UI
+app.get("/admin/logs", basicAuth, async (req, res) => {
+  try {
+    const sinceHours = safeText(req.query.h || "24");
+    const phone = safeText(req.query.phone);
+    const mac = safeText(req.query.mac);
+    const ip = safeText(req.query.ip);
+    const event = safeText(req.query.event);
+    const limit = safeText(req.query.limit || "200");
+    const offset = safeText(req.query.offset || "0");
+
+    const { rows, total } = await fetchLogs({ sinceHours, phone, mac, ip, event, limit, offset });
+
+    const events = ["OTP_CREATED", "OTP_VERIFIED"];
+    const rowsHtml = rows
+      .map((r) => {
+        const ok = r.row_hash && (r.prev_hash !== undefined);
+        return `<tr>
+          <td>${r.id}</td>
+          <td>${new Date(r.created_at).toLocaleString("tr-TR")}</td>
+          <td><b>${r.event}</b></td>
+          <td>${(r.first_name || "")} ${(r.last_name || "")}<div class="muted">${r.phone || ""}</div></td>
+          <td>${r.client_mac || ""}<div class="muted">${r.client_ip || ""}</div></td>
+          <td>${r.ssid || ""}<div class="muted">${r.ap_name || ""}</div></td>
+          <td>${r.kvkk_accepted ? `<span class="ok">true</span>` : `<span class="bad">false</span>`}<div class="muted">${r.kvkk_version || ""}</div></td>
+          <td>${ok ? `<span class="ok">hash</span>` : `<span class="bad">-</span>`}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const body = `
+      <div class="card">
+        <h1>5651 Logları</h1>
+        <div class="muted">Filtrele, görüntüle, dışa aktar (CSV/JSON) ve hash-zincir doğrulama.</div>
+
+        <form class="toolbar" method="GET" action="/admin/logs">
+          <div>
+            <label>Son kaç saat</label>
+            <input name="h" value="${sinceHours || ""}" style="width:110px"/>
+          </div>
+          <div>
+            <label>Telefon</label>
+            <input name="phone" value="${phone || ""}" placeholder="0533..."/>
+          </div>
+          <div>
+            <label>MAC</label>
+            <input name="mac" value="${mac || ""}" placeholder="96:47:..."/>
+          </div>
+          <div>
+            <label>IP</label>
+            <input name="ip" value="${ip || ""}" placeholder="10.120..."/>
+          </div>
+          <div>
+            <label>Event</label>
+            <select name="event">
+              <option value="">(hepsi)</option>
+              ${events.map((e) => `<option value="${e}" ${event === e ? "selected" : ""}>${e}</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label>Limit</label>
+            <input name="limit" value="${limit || ""}" style="width:90px"/>
+          </div>
+          <div>
+            <input type="hidden" name="offset" value="0"/>
+            <button class="btn" type="submit">Uygula</button>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <a class="btn ghost" href="/admin/export.csv?h=${encodeURIComponent(sinceHours || "")}&phone=${encodeURIComponent(phone || "")}&mac=${encodeURIComponent(mac || "")}&ip=${encodeURIComponent(ip || "")}&event=${encodeURIComponent(event || "")}">CSV</a>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <a class="btn ghost" href="/admin/export.json?h=${encodeURIComponent(sinceHours || "")}&phone=${encodeURIComponent(phone || "")}&mac=${encodeURIComponent(mac || "")}&ip=${encodeURIComponent(ip || "")}&event=${encodeURIComponent(event || "")}">JSON</a>
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <a class="btn ghost" href="/admin/verify-chain?h=${encodeURIComponent(sinceHours || "")}">Hash Doğrula</a>
+          </div>
+        </form>
+
+        <div style="margin-top:10px" class="muted">
+          Toplam: <b>${total}</b> | Gösterilen: <b>${rows.length}</b>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Zaman</th><th>Event</th><th>Kullanıcı</th><th>Cihaz</th><th>SSID/AP</th><th>KVKK</th><th>İmza</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml || `<tr><td colspan="8" class="muted">Kayıt yok</td></tr>`}
+          </tbody>
+        </table>
+
+        <div style="margin-top:12px" class="muted">
+          Not: “İmzalama” şu an <b>HMAC hash-zinciri</b> (placeholder). Gerçek e-imza/HSM entegrasyonu istersen bir sonraki adımda “gün sonu imzalı paket” formatına geçeriz.
+        </div>
+      </div>
+    `;
+
+    res.status(200).send(adminLayout("Admin Logs", body));
+  } catch (e) {
+    log("ADMIN_LOGS_ERR", e);
+    res.status(500).send(adminLayout("Admin Logs", `<div class="card"><h1>Hata</h1><pre>${String(e?.stack || e)}</pre></div>`));
   }
-
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const rows = await qRows(
-    `SELECT id, created_at, event, client_mac, client_ip, ssid, ap_name, phone, full_name, marker, kvkk_version, meta
-     FROM access_logs
-     ${whereSql}
-     ORDER BY created_at DESC
-     LIMIT ${limit}`,
-    params
-  );
-
-  // quick aggregates (last 24h)
-  const aggPhones = await qRows(
-    `SELECT phone, COUNT(*)::int AS c
-     FROM access_logs
-     WHERE created_at >= now() - interval '24 hours' AND phone IS NOT NULL AND phone <> ''
-     GROUP BY phone
-     ORDER BY c DESC
-     LIMIT 20`, []
-  );
-
-  const aggMacs = await qRows(
-    `SELECT client_mac, COUNT(*)::int AS c
-     FROM access_logs
-     WHERE created_at >= now() - interval '24 hours' AND client_mac IS NOT NULL AND client_mac <> ''
-     GROUP BY client_mac
-     ORDER BY c DESC
-     LIMIT 20`, []
-  );
-
-  const aggIps = await qRows(
-    `SELECT client_ip, COUNT(*)::int AS c
-     FROM access_logs
-     WHERE created_at >= now() - interval '24 hours' AND client_ip IS NOT NULL AND client_ip <> ''
-     GROUP BY client_ip
-     ORDER BY c DESC
-     LIMIT 20`, []
-  );
-
-  const chips = (label, items) => `
-    <div style="margin-top:10px">
-      <div class="mut">${escHtml(label)}</div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
-        ${items.map(x => `<span class="chip">${escHtml(String(Object.values(x)[0] || ''))} <span class="mut">(${escHtml(String(x.c || ''))})</span></span>`).join('')}
-      </div>
-    </div>
-  `;
-
-  res.send(renderPage('Admin Logs', `
-    <div class="topline">
-      <div>
-        <h2>5651 Log Raporu</h2>
-        <div class="mut">Son kayıtlar + hızlı filtre</div>
-      </div>
-      <div class="badge">/admin/logs</div>
-    </div>
-
-    <form class="search" method="GET" action="/admin/logs">
-      <div style="flex:1">
-        <label>Arama (telefon / mac / ip / ad / marker)</label>
-        <input name="q" value="${escHtml(q)}" placeholder="örn: 5333... veya 96:47:..."/>
-      </div>
-      <div style="width:180px">
-        <label>Zaman</label>
-        <select name="mode" style="width:100%;padding:12px;border-radius:12px;border:1px solid #d1d5db">
-          <option value="last24" ${mode === 'last24' ? 'selected' : ''}>Son 24 saat</option>
-          <option value="last7d" ${mode === 'last7d' ? 'selected' : ''}>Son 7 gün</option>
-          <option value="all" ${mode === 'all' ? 'selected' : ''}>Tümü</option>
-        </select>
-      </div>
-      <div style="width:130px">
-        <label>Limit</label>
-        <input name="limit" value="${escHtml(String(limit))}" inputmode="numeric"/>
-      </div>
-      <div style="width:140px">
-        <button type="submit">Filtrele</button>
-      </div>
-    </form>
-
-    ${chips('Son 24 saat - Telefon (Top 20)', aggPhones)}
-    ${chips('Son 24 saat - MAC (Top 20)', aggMacs)}
-    ${chips('Son 24 saat - IP (Top 20)', aggIps)}
-
-    <table>
-      <thead>
-        <tr>
-          <th>Zaman</th>
-          <th>Event</th>
-          <th>Telefon / Ad</th>
-          <th>MAC / IP</th>
-          <th>SSID / AP</th>
-          <th>Marker</th>
-          <th>Meta</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows.map(r => `
-          <tr>
-            <td>${escHtml(new Date(r.created_at).toLocaleString('tr-TR'))}</td>
-            <td>${escHtml(r.event)}</td>
-            <td>${escHtml(r.phone || '')}<div class="mut">${escHtml(r.full_name || '')}</div></td>
-            <td>${escHtml(r.client_mac || '')}<div class="mut">${escHtml(r.client_ip || '')}</div></td>
-            <td>${escHtml(r.ssid || '')}<div class="mut">${escHtml(r.ap_name || '')}</div></td>
-            <td>${escHtml(r.marker || '')}</td>
-            <td><pre style="margin:0;white-space:pre-wrap">${fmtJson(r.meta)}</pre></td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>
-  `));
 });
 
-/* =======================
- * START
- * ======================= */
+// Export CSV
+app.get("/admin/export.csv", basicAuth, async (req, res) => {
+  try {
+    const sinceHours = safeText(req.query.h || "24");
+    const phone = safeText(req.query.phone);
+    const mac = safeText(req.query.mac);
+    const ip = safeText(req.query.ip);
+    const event = safeText(req.query.event);
+
+    const { rows } = await fetchLogs({ sinceHours, phone, mac, ip, event, limit: 2000, offset: 0 });
+
+    const headers = [
+      "id","created_at","event","first_name","last_name","phone","kvkk_accepted","kvkk_version",
+      "client_mac","client_ip","ssid","ap_name","base_grant_url","continue_url",
+      "node_mac","node_id","gateway_id","public_ip","user_agent","prev_hash","row_hash","meta"
+    ];
+
+    const csvEscape = (v) => {
+      if (v === null || v === undefined) return "";
+      const s = typeof v === "string" ? v : JSON.stringify(v);
+      if (/[,"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+
+    let out = headers.join(",") + "\n";
+    for (const r of rows) {
+      const line = headers.map((h) => csvEscape(r[h])).join(",");
+      out += line + "\n";
+    }
+
+    // “paket imzası” placeholder: tüm dosyayı hashle
+    const packSig = hmacHex(SIGNING_SECRET, out);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("X-Package-Signature", packSig);
+    res.status(200).send(out);
+  } catch (e) {
+    log("EXPORT_CSV_ERR", e);
+    res.status(500).send("export error");
+  }
+});
+
+// Export JSON
+app.get("/admin/export.json", basicAuth, async (req, res) => {
+  try {
+    const sinceHours = safeText(req.query.h || "24");
+    const phone = safeText(req.query.phone);
+    const mac = safeText(req.query.mac);
+    const ip = safeText(req.query.ip);
+    const event = safeText(req.query.event);
+
+    const { rows } = await fetchLogs({ sinceHours, phone, mac, ip, event, limit: 2000, offset: 0 });
+
+    const payload = { exported_at: nowIso(), rows };
+    const raw = JSON.stringify(payload);
+    const packSig = hmacHex(SIGNING_SECRET, raw);
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("X-Package-Signature", packSig);
+    res.status(200).send(raw);
+  } catch (e) {
+    log("EXPORT_JSON_ERR", e);
+    res.status(500).send("export error");
+  }
+});
+
+// Verify hash-chain
+app.get("/admin/verify-chain", basicAuth, async (req, res) => {
+  try {
+    const sinceHours = safeText(req.query.h || "24");
+
+    if (!pool) return res.status(500).send("DB not configured");
+
+    const q = await pool.query(
+      `SELECT * FROM access_logs WHERE created_at >= now() - ($1::int || ' hours')::interval ORDER BY id ASC;`,
+      [sinceHours]
+    );
+
+    let ok = 0;
+    let bad = 0;
+    let lastHash = null;
+    const badSamples = [];
+
+    for (const r of q.rows) {
+      const row = {
+        created_at: new Date(r.created_at).toISOString(),
+        event: r.event,
+        first_name: r.first_name,
+        last_name: r.last_name,
+        phone: r.phone,
+        kvkk_accepted: r.kvkk_accepted,
+        kvkk_version: r.kvkk_version,
+        client_mac: r.client_mac,
+        client_ip: r.client_ip,
+        ssid: r.ssid,
+        ap_name: r.ap_name,
+        base_grant_url: r.base_grant_url,
+        continue_url: r.continue_url,
+        node_mac: r.node_mac,
+        node_id: r.node_id,
+        gateway_id: r.gateway_id,
+        public_ip: r.public_ip,
+        user_agent: r.user_agent,
+        meta: r.meta,
+        prev_hash: r.prev_hash,
+      };
+
+      const canon = canonicalRowForHash(row);
+      const expected = hmacHex(SIGNING_SECRET, canon);
+
+      const chainOk = (r.prev_hash || null) === (lastHash || null);
+      const hashOk = expected === r.row_hash;
+
+      if (chainOk && hashOk) ok++;
+      else {
+        bad++;
+        if (badSamples.length < 10) {
+          badSamples.push({ id: r.id, chainOk, hashOk, prev_db: r.prev_hash, prev_calc: lastHash, row_hash_db: r.row_hash, row_hash_calc: expected });
+        }
+      }
+      lastHash = r.row_hash || lastHash;
+    }
+
+    const body = `
+      <div class="card">
+        <h1>Hash Zinciri Doğrulama</h1>
+        <div class="muted">Son ${sinceHours} saatlik kayıtlar için kontrol.</div>
+        <div style="margin-top:10px">
+          <span class="chip">OK: <b class="ok">${ok}</b></span>
+          <span class="chip">BAD: <b class="bad">${bad}</b></span>
+        </div>
+        ${bad ? `<h3 style="margin-top:14px">Örnek Hatalar</h3><pre>${JSON.stringify(badSamples, null, 2)}</pre>` : `<div style="margin-top:12px" class="ok">Zincir sağlam ✅</div>`}
+        <div style="margin-top:12px" class="muted">
+          Not: Bu yöntem “değiştirilemezlik kanıtı” sağlar. 5651 için gerçek dünyada ayrıca <b>zaman damgası</b> ve/veya <b>e-imza</b> ile “gün sonu” paket imzalama yapılır.
+        </div>
+        <div style="margin-top:12px">
+          <a class="btn ghost" href="/admin/logs">Geri</a>
+        </div>
+      </div>
+    `;
+    res.status(200).send(adminLayout("Verify Chain", body));
+  } catch (e) {
+    log("VERIFY_CHAIN_ERR", e);
+    res.status(500).send(adminLayout("Verify Chain", `<div class="card"><h1>Hata</h1><pre>${String(e?.stack || e)}</pre></div>`));
+  }
+});
+
+// -------------------- STARTUP --------------------
 (async () => {
-  await initDatabase();
-  await initRedis();
-  await getPublicIpCached(); // warm cache
-  app.listen(ENV.PORT, () => console.log(`Server running on port ${ENV.PORT}`));
+  try {
+    log("ENV:", {
+      OTP_MODE,
+      OTP_TTL_SECONDS,
+      RL_MAC_SECONDS,
+      RL_PHONE_SECONDS,
+      MAX_WRONG_ATTEMPTS,
+      LOCK_SECONDS,
+      KVKK_VERSION,
+      ADMIN_USER_SET: !!ADMIN_USER,
+      ADMIN_PASS_SET: !!ADMIN_PASS,
+      REDIS: !!redis,
+      DB: !!pool,
+    });
+
+    if (redis) log("REDIS: connected");
+    else log("REDIS: not configured");
+
+    if (pool) await dbInit();
+
+    app.listen(PORT, () => {
+      log(`Server running on port ${PORT}`);
+    });
+  } catch (e) {
+    log("BOOT_ERR", e);
+    process.exit(1);
+  }
 })();
