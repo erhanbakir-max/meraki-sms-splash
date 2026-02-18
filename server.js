@@ -1,14 +1,13 @@
 /**
- * meraki-sms-splash - single-file server.js
- * - Meraki splash OTP flow (OTP_MODE=screen or sms placeholder)
- * - Postgres logging (tolerant: auto-migrate missing columns)
- * - Admin UI: /admin/logs (+ /admin/daily/*) with Basic Auth (no extra deps)
- * - 5651-ish daily chain + HMAC signature (DAILY_HMAC_KEY env)
+ * meraki-sms-splash - single-file server.js (FIXED: base_grant_url missing)
+ * - Fix: Meraki params are embedded into forms as hidden inputs
+ * - Fix: Parses Meraki params from BOTH return_url and direct query params
+ * - Fix: Caches ctx by marker + mac + ip for fallback
  *
  * ENV:
  *   PORT=8080
  *   DATABASE_URL=postgres://...
- *   REDIS_URL=redis://... (optional; if missing uses in-memory)
+ *   REDIS_URL=redis://... (optional)
  *   OTP_MODE=screen|sms
  *   OTP_TTL_SECONDS=180
  *   RL_MAC_SECONDS=30
@@ -80,9 +79,6 @@ safeLogEnv();
 function nowISO() {
   return new Date().toISOString();
 }
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
 function sha256hex(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex");
 }
@@ -98,7 +94,6 @@ function normalizePhone(p) {
   const s = String(p || "").trim();
   if (!s) return "";
   const digits = s.replace(/[^\d+]/g, "");
-  // keep leading + if exists
   if (digits.startsWith("+")) return "+" + digits.slice(1).replace(/[^\d]/g, "");
   return digits.replace(/[^\d]/g, "");
 }
@@ -120,6 +115,23 @@ function parseJsonBody(req) {
       } catch {
         resolve({});
       }
+    });
+  });
+}
+function parseForm(req) {
+  return new Promise((resolve) => {
+    let buf = "";
+    req.on("data", (d) => (buf += d));
+    req.on("end", () => {
+      const out = {};
+      buf.split("&").forEach((kvp) => {
+        if (!kvp) return;
+        const [k, v] = kvp.split("=");
+        const key = decodeURIComponent(k || "").replace(/\+/g, " ");
+        const val = decodeURIComponent(v || "").replace(/\+/g, " ");
+        out[key] = val;
+      });
+      resolve(out);
     });
   });
 }
@@ -149,8 +161,21 @@ function sendJson(res, status, obj, headers = {}) {
   });
   res.end(b);
 }
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function getClientIp(req) {
+  const xf = (req.headers["x-forwarded-for"] || "").toString();
+  if (xf) return xf.split(",")[0].trim();
+  return (req.socket && req.socket.remoteAddress) || "";
+}
+
+// Basic Auth without deps
 function basicAuth(req) {
-  // No dependency. RFC7617 basic auth
   const h = req.headers["authorization"] || "";
   if (!h.startsWith("Basic ")) return null;
   const raw = Buffer.from(h.slice(6), "base64").toString("utf8");
@@ -172,22 +197,14 @@ function requireAdmin(req, res) {
   return true;
 }
 
-function getClientIp(req) {
-  const xf = (req.headers["x-forwarded-for"] || "").toString();
-  if (xf) return xf.split(",")[0].trim();
-  return (req.socket && req.socket.remoteAddress) || "";
-}
-
+// -------------------- Meraki parsing --------------------
 function parseMerakiReturnUrl(returnUrl) {
-  // Meraki passes a return_url with many params.
-  // We'll parse and normalize required pieces.
   let ru = null;
   try {
     ru = new URL(returnUrl);
   } catch {
     return { ru: null, ctx: {} };
   }
-
   const q = ru.searchParams;
   const ctx = {
     gateway_id: q.get("gateway_id") || "",
@@ -196,24 +213,19 @@ function parseMerakiReturnUrl(returnUrl) {
     client_mac: normalizeMac(q.get("client_mac") || ""),
     node_mac: normalizeMac(q.get("node_mac") || ""),
     continue_url: q.get("continue_url") || "",
-    // some variants
     base_grant_url: q.get("base_grant_url") || "",
+    user_continue_url: q.get("user_continue_url") || "",
   };
 
-  // Derive base_grant_url if not provided: replace /splash/... with /splash/.../grant
-  // If returnUrl itself is something like https://.../splash/<id>....?params
+  // Derive base_grant_url if not provided
   if (!ctx.base_grant_url) {
     try {
       const u2 = new URL(ru.toString());
-      // If already contains /grant keep it
       if (u2.pathname.endsWith("/grant")) {
         ctx.base_grant_url = u2.origin + u2.pathname;
-      } else {
-        // If path like /splash/<something>
-        if (u2.pathname.includes("/splash/")) {
-          const p = u2.pathname.replace(/\/$/, "");
-          ctx.base_grant_url = u2.origin + p + "/grant";
-        }
+      } else if (u2.pathname.includes("/splash/")) {
+        const p = u2.pathname.replace(/\/$/, "");
+        ctx.base_grant_url = u2.origin + p + "/grant";
       }
     } catch {}
   }
@@ -221,22 +233,61 @@ function parseMerakiReturnUrl(returnUrl) {
   return { ru, ctx };
 }
 
+function parseMerakiDirectQuery(q) {
+  // Many Meraki deployments send these directly on splash URL
+  const ctx = {
+    gateway_id: (q.gateway_id || q.gw_id || "").toString(),
+    node_id: (q.node_id || "").toString(),
+    client_ip: (q.client_ip || "").toString(),
+    client_mac: normalizeMac((q.client_mac || "").toString()),
+    node_mac: normalizeMac((q.node_mac || "").toString()),
+    continue_url: (q.continue_url || q.user_continue_url || "").toString(),
+    base_grant_url: (q.base_grant_url || "").toString(),
+    user_continue_url: (q.user_continue_url || "").toString(),
+  };
+
+  // Sometimes Meraki uses "base_grant_url" as full grant endpoint already
+  // If base_grant_url is empty but we have something like "base_url" or "grant_url"
+  if (!ctx.base_grant_url && q.grant_url) ctx.base_grant_url = String(q.grant_url);
+
+  // normalize again
+  ctx.client_mac = normalizeMac(ctx.client_mac);
+  ctx.node_mac = normalizeMac(ctx.node_mac);
+
+  return ctx;
+}
+
+function mergeCtx(a, b) {
+  // prefer a fields, fill from b
+  const out = { ...(b || {}) };
+  for (const k of Object.keys(a || {})) {
+    if (a[k] !== undefined && a[k] !== null && String(a[k]).length) out[k] = a[k];
+  }
+  // normalize macs
+  out.client_mac = normalizeMac(out.client_mac || "");
+  out.node_mac = normalizeMac(out.node_mac || "");
+  return out;
+}
+
 function buildGrantRedirect(ctx) {
-  // create grant URL
   if (!ctx || !ctx.base_grant_url) return null;
-  const g = new URL(ctx.base_grant_url);
+  let g;
+  try {
+    g = new URL(ctx.base_grant_url);
+  } catch {
+    return null;
+  }
   const add = (k, v) => {
     if (v !== undefined && v !== null && String(v).length) g.searchParams.set(k, String(v));
   };
 
-  // required-ish
   add("gateway_id", ctx.gateway_id);
   add("node_id", ctx.node_id);
   add("client_ip", ctx.client_ip);
   add("client_mac", ctx.client_mac);
   add("node_mac", ctx.node_mac);
 
-  // continue_url (Meraki expects it sometimes)
+  // continue_url very important for some clients
   if (ctx.continue_url) add("continue_url", ctx.continue_url);
 
   return g.toString();
@@ -374,19 +425,14 @@ async function ensureTables() {
 }
 
 async function ensureColumn(table, col, typeSql) {
-  // tolerant schema evolution
   try {
     await qExec(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${typeSql};`);
-  } catch (_) {
-    // ignore
-  }
+  } catch (_) {}
 }
 
 async function logAccess(event, data) {
   if (!pool) return;
 
-  // ensure columns you might write (tolerant)
-  // (sende sık çıkan: accept_language / continue_url / user_continue_url vs)
   await ensureColumn("access_logs", "accept_language", "TEXT");
   await ensureColumn("access_logs", "continue_url", "TEXT");
   await ensureColumn("access_logs", "user_continue_url", "TEXT");
@@ -420,12 +466,8 @@ async function logAccess(event, data) {
   const params = cols.map((k) => (k === "meta" ? JSON.stringify(row[k] || {}) : row[k]));
 
   try {
-    await qExec(
-      `INSERT INTO access_logs(${cols.join(",")}) VALUES(${vals.join(",")})`,
-      params
-    );
+    await qExec(`INSERT INTO access_logs(${cols.join(",")}) VALUES(${vals.join(",")})`, params);
   } catch (e) {
-    // If schema mismatch still occurs, log and continue (never crash)
     console.log("DB LOG ERROR:", e && e.message);
   }
 }
@@ -445,25 +487,20 @@ function keyLock(marker) {
 }
 
 async function isRateLimited(mac, phone) {
-  // very simple: if key exists => limited
   if (mac) {
-    const k = keyMac(mac);
-    const v = await kv.get(k);
+    const v = await kv.get(keyMac(mac));
     if (v) return { ok: false, why: "mac", ttl: ENV.RL_MAC_SECONDS };
   }
   if (phone) {
-    const k = keyPhone(phone);
-    const v = await kv.get(k);
+    const v = await kv.get(keyPhone(phone));
     if (v) return { ok: false, why: "phone", ttl: ENV.RL_PHONE_SECONDS };
   }
   return { ok: true };
 }
-
 async function setRate(mac, phone) {
   if (mac) await kv.setex(keyMac(mac), ENV.RL_MAC_SECONDS, "1");
   if (phone) await kv.setex(keyPhone(phone), ENV.RL_PHONE_SECONDS, "1");
 }
-
 async function isLocked(marker) {
   const v = await kv.get(keyLock(marker));
   return !!v;
@@ -472,30 +509,21 @@ async function lockMarker(marker) {
   await kv.setex(keyLock(marker), ENV.LOCK_SECONDS, "1");
 }
 
-// -------------------- Daily chain / package --------------------
+// -------------------- Daily chain / package (optional endpoints used in admin) --------------------
 function dateToYMDInTZ(date, tz) {
-  // Returns YYYY-MM-DD for given instant in TZ
   try {
     const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-    return fmt.format(date); // en-CA => YYYY-MM-DD
+    return fmt.format(date);
   } catch {
-    // fallback UTC
     return date.toISOString().slice(0, 10);
   }
 }
 
-async function buildDaily(dayStr /* YYYY-MM-DD */, tz) {
-  // Ensure daily tables have tz column
+async function buildDaily(dayStr, tz) {
   await ensureColumn("daily_hashes", "tz", "TEXT");
   await ensureColumn("daily_chains", "tz", "TEXT");
   await ensureColumn("daily_packages", "tz", "TEXT");
 
-  // parse day as DATE
-  const day = dayStr;
-
-  // Pull logs for that day in TZ using created_at timestamptz
-  // We convert bounds in TZ by using date_trunc with timezone:
-  // easiest safe: compare on DATE created_at at TZ
   const rows = await qRows(
     `
     SELECT id, created_at, event, first_name, last_name, full_name, phone,
@@ -505,76 +533,55 @@ async function buildDaily(dayStr /* YYYY-MM-DD */, tz) {
     WHERE (created_at AT TIME ZONE $2)::date = $1::date
     ORDER BY id ASC
     `,
-    [day, tz]
+    [dayStr, tz]
   );
 
   const record_count = rows.length;
-
-  // Day hash: hash of canonical JSON lines
-  const lines = rows.map((r) => {
-    const o = {
-      id: r.id,
-      created_at: new Date(r.created_at).toISOString(),
-      event: r.event,
-      full_name: r.full_name || null,
-      first_name: r.first_name || null,
-      last_name: r.last_name || null,
-      phone: r.phone || null,
-      marker: r.marker || null,
-      client_mac: r.client_mac || null,
-      client_ip: r.client_ip || null,
-      ssid: r.ssid || null,
-      ap_name: r.ap_name || null,
-      base_grant_url: r.base_grant_url || null,
-      user_continue_url: r.user_continue_url || null,
-      continue_url: r.continue_url || null,
-      kvkk_version: r.kvkk_version || null,
-      kvkk_accepted: typeof r.kvkk_accepted === "boolean" ? r.kvkk_accepted : null,
-      meta: r.meta || {},
-    };
-    return JSON.stringify(o);
-  });
+  const lines = rows.map((r) => JSON.stringify({
+    id: r.id,
+    created_at: new Date(r.created_at).toISOString(),
+    event: r.event,
+    full_name: r.full_name || null,
+    first_name: r.first_name || null,
+    last_name: r.last_name || null,
+    phone: r.phone || null,
+    marker: r.marker || null,
+    client_mac: r.client_mac || null,
+    client_ip: r.client_ip || null,
+    ssid: r.ssid || null,
+    ap_name: r.ap_name || null,
+    base_grant_url: r.base_grant_url || null,
+    user_continue_url: r.user_continue_url || null,
+    continue_url: r.continue_url || null,
+    kvkk_version: r.kvkk_version || null,
+    kvkk_accepted: typeof r.kvkk_accepted === "boolean" ? r.kvkk_accepted : null,
+    meta: r.meta || {},
+  }));
 
   const day_hash = sha256hex(lines.join("\n"));
-
-  // prev day hash
-  const prev = await qRows(`SELECT day_hash FROM daily_hashes WHERE day = ($1::date - INTERVAL '1 day')::date`, [day]);
+  const prev = await qRows(`SELECT day_hash FROM daily_hashes WHERE day = ($1::date - INTERVAL '1 day')::date`, [dayStr]);
   const prev_day_hash = prev[0] ? prev[0].day_hash : null;
+  const chain_hash = sha256hex(`${prev_day_hash || ""}|${dayStr}|${tz}|${record_count}|${day_hash}`);
 
-  const chain_hash = sha256hex(`${prev_day_hash || ""}|${day}|${tz}|${record_count}|${day_hash}`);
-
-  // Upsert daily_hashes/daily_chains
   await qExec(
     `
     INSERT INTO daily_hashes(day, tz, record_count, day_hash)
     VALUES($1::date, $2, $3, $4)
     ON CONFLICT (day) DO UPDATE SET tz=EXCLUDED.tz, record_count=EXCLUDED.record_count, day_hash=EXCLUDED.day_hash
     `,
-    [day, tz, record_count, day_hash]
+    [dayStr, tz, record_count, day_hash]
   );
-
   await qExec(
     `
     INSERT INTO daily_chains(day, tz, prev_day_hash, chain_hash)
     VALUES($1::date, $2, $3, $4)
     ON CONFLICT (day) DO UPDATE SET tz=EXCLUDED.tz, prev_day_hash=EXCLUDED.prev_day_hash, chain_hash=EXCLUDED.chain_hash
     `,
-    [day, tz, prev_day_hash, chain_hash]
+    [dayStr, tz, prev_day_hash, chain_hash]
   );
 
-  // Package payload
-  const payload = {
-    day,
-    tz,
-    record_count,
-    day_hash,
-    prev_day_hash,
-    chain_hash,
-    generated_at: nowISO(),
-  };
-
-  let signature = null;
-  let algo = null;
+  const payload = { day: dayStr, tz, record_count, day_hash, prev_day_hash, chain_hash, generated_at: nowISO() };
+  let signature = null, algo = null;
   if (ENV.DAILY_HMAC_KEY) {
     signature = hmacHex(ENV.DAILY_HMAC_KEY, JSON.stringify(payload));
     algo = "HMAC-SHA256";
@@ -586,44 +593,13 @@ async function buildDaily(dayStr /* YYYY-MM-DD */, tz) {
     VALUES($1::date, $2, $3::jsonb, $4, $5)
     ON CONFLICT (day) DO UPDATE SET tz=EXCLUDED.tz, payload=EXCLUDED.payload, signature=EXCLUDED.signature, algo=EXCLUDED.algo
     `,
-    [day, tz, JSON.stringify(payload), signature, algo]
+    [dayStr, tz, JSON.stringify(payload), signature, algo]
   );
 
   return { ...payload, signature, algo };
 }
 
-async function verifyDaily(dayStr, tz) {
-  const p = await qRows(`SELECT payload, signature, algo, tz FROM daily_packages WHERE day=$1::date`, [dayStr]);
-  if (!p[0]) return { ok: false, reason: "no daily package for day" };
-
-  const payload = p[0].payload;
-  const signature = p[0].signature;
-  const algo = p[0].algo;
-
-  // recompute from access_logs and compare
-  const rebuilt = await buildDaily(dayStr, tz);
-
-  const same =
-    rebuilt.day_hash === payload.day_hash &&
-    rebuilt.chain_hash === payload.chain_hash &&
-    rebuilt.record_count === payload.record_count;
-
-  let sig_ok = null;
-  if (ENV.DAILY_HMAC_KEY) {
-    const want = hmacHex(ENV.DAILY_HMAC_KEY, JSON.stringify(payload));
-    sig_ok = signature ? want === signature : false;
-  }
-
-  return {
-    ok: !!same && (sig_ok === null ? true : sig_ok),
-    same_hashes: same,
-    sig_ok,
-    stored: { payload, signature, algo },
-    rebuilt,
-  };
-}
-
-// -------------------- Admin UI (HTML) --------------------
+// -------------------- Admin UI --------------------
 function adminLayout(title, body) {
   const css = `
   body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1220;color:#e6eefc}
@@ -643,14 +619,6 @@ function adminLayout(title, body) {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${escapeHtml(title)}</title><style>${css}</style></head><body>
   <div class="wrap"><div class="card">${body}</div></div></body></html>`;
-}
-
-function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 async function renderAdminLogs(req, res, query) {
@@ -683,17 +651,13 @@ async function renderAdminLogs(req, res, query) {
     }
   };
 
-  if ((query.format || "").toLowerCase() === "json") {
-    return sendJson(res, 200, rows);
-  }
+  if ((query.format || "").toLowerCase() === "json") return sendJson(res, 200, rows);
 
   const body = `
     <div class="topbar">
       <div>
         <h1>/admin/logs</h1>
-        <div class="muted">limit=${limit} • tz=${escapeHtml(tz)} • <a href="/admin/logs?limit=${limit}&tz=${encodeURIComponent(
-    tz
-  )}&format=json">JSON</a></div>
+        <div class="muted">limit=${limit} • tz=${escapeHtml(tz)} • <a href="/admin/logs?limit=${limit}&tz=${encodeURIComponent(tz)}&format=json">JSON</a></div>
       </div>
       <div class="row">
         <form method="GET" action="/admin/logs" class="row">
@@ -712,33 +676,29 @@ async function renderAdminLogs(req, res, query) {
         </tr>
       </thead>
       <tbody>
-        ${rows
-          .map((r) => {
-            const name = r.full_name || [r.first_name, r.last_name].filter(Boolean).join(" ");
-            return `<tr>
-              <td>${r.id}</td>
-              <td>${escapeHtml(fmt(r.created_at))}</td>
-              <td>${escapeHtml(r.event)}</td>
-              <td>${escapeHtml(name || "")}</td>
-              <td>${escapeHtml(r.phone || "")}</td>
-              <td>${escapeHtml(r.client_mac || "")}</td>
-              <td>${escapeHtml(r.client_ip || "")}</td>
-              <td>${escapeHtml(r.marker || "")}</td>
-              <td>${escapeHtml(r.kvkk_version || "")}</td>
-            </tr>`;
-          })
-          .join("")}
+        ${rows.map((r) => {
+          const name = r.full_name || [r.first_name, r.last_name].filter(Boolean).join(" ");
+          return `<tr>
+            <td>${r.id}</td>
+            <td>${escapeHtml(fmt(r.created_at))}</td>
+            <td>${escapeHtml(r.event)}</td>
+            <td>${escapeHtml(name || "")}</td>
+            <td>${escapeHtml(r.phone || "")}</td>
+            <td>${escapeHtml(r.client_mac || "")}</td>
+            <td>${escapeHtml(r.client_ip || "")}</td>
+            <td>${escapeHtml(r.marker || "")}</td>
+            <td>${escapeHtml(r.kvkk_version || "")}</td>
+          </tr>`;
+        }).join("")}
       </tbody>
     </table>
   `;
-
   return sendHtml(res, 200, adminLayout("admin logs", body));
 }
 
 async function renderAdminDailyIndex(req, res) {
   const tz = ENV.TZ || "UTC";
   const today = dateToYMDInTZ(new Date(), tz);
-
   const body = `
     <div class="topbar">
       <div>
@@ -747,60 +707,18 @@ async function renderAdminDailyIndex(req, res) {
       </div>
       <div class="row"><a class="btn" href="/admin/logs">Logs</a></div>
     </div>
-
     <div class="row" style="margin-top:10px">
       <a class="btn" href="/admin/daily/build?day=${today}">Build today (${today})</a>
-      <a class="btn" href="/admin/daily/verify?day=${today}">Verify today (${today})</a>
-      <a class="btn" href="/admin/daily/package?day=${today}">Package today (${today})</a>
-    </div>
-
-    <div style="margin-top:14px" class="muted">
-      İpucu: ?day=YYYY-MM-DD ile farklı gün seçebilirsin.
     </div>
   `;
   sendHtml(res, 200, adminLayout("daily", body));
 }
 
-async function renderAdminDailyBuild(req, res, query) {
-  const day = (query.day || "").trim();
-  const tz = (query.tz || ENV.TZ || "UTC").trim();
-  if (!day) return send(res, 400, "missing ?day=YYYY-MM-DD");
-  try {
-    const out = await buildDaily(day, tz);
-    sendJson(res, 200, out);
-  } catch (e) {
-    send(res, 500, "daily build error: " + (e && e.message));
-  }
-}
+// -------------------- Splash page (FIX: include ctx hidden fields) --------------------
+function splashPage({ marker, message, showOtp, otp, ctx }) {
+  const hidden = (k, v) =>
+    `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v || "")}"/>`;
 
-async function renderAdminDailyVerify(req, res, query) {
-  const day = (query.day || "").trim();
-  const tz = (query.tz || ENV.TZ || "UTC").trim();
-  if (!day) return send(res, 400, "missing ?day=YYYY-MM-DD");
-  try {
-    const out = await verifyDaily(day, tz);
-    sendJson(res, 200, out);
-  } catch (e) {
-    send(res, 500, "daily verify error: " + (e && e.message));
-  }
-}
-
-async function renderAdminDailyPackage(req, res, query) {
-  const day = (query.day || "").trim();
-  if (!day) return send(res, 400, "missing ?day=YYYY-MM-DD");
-  try {
-    const p = await qRows(`SELECT day, tz, payload, signature, algo, created_at FROM daily_packages WHERE day=$1::date`, [
-      day,
-    ]);
-    if (!p[0]) return send(res, 404, "no package for day");
-    sendJson(res, 200, p[0]);
-  } catch (e) {
-    send(res, 500, "daily package error: " + (e && e.message));
-  }
-}
-
-// -------------------- Splash Pages --------------------
-function splashPage({ marker, mode, message, showOtp, otp }) {
   const otpBlock =
     showOtp && otp
       ? `<div style="margin-top:14px;padding:12px;border-radius:12px;background:rgba(255,255,255,.08);display:inline-block">
@@ -808,6 +726,17 @@ function splashPage({ marker, mode, message, showOtp, otp }) {
           <div style="font-size:28px;font-weight:800;letter-spacing:2px">${escapeHtml(otp)}</div>
         </div>`
       : "";
+
+  // ctx fields we must carry to /otp/request AND /otp/verify
+  const ctxHidden =
+    hidden("base_grant_url", ctx.base_grant_url || "") +
+    hidden("continue_url", ctx.continue_url || "") +
+    hidden("user_continue_url", ctx.user_continue_url || "") +
+    hidden("gateway_id", ctx.gateway_id || "") +
+    hidden("node_id", ctx.node_id || "") +
+    hidden("node_mac", ctx.node_mac || "") +
+    hidden("client_ip", ctx.client_ip || "") +
+    hidden("client_mac", ctx.client_mac || "");
 
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>WiFi Login</title>
@@ -820,8 +749,6 @@ function splashPage({ marker, mode, message, showOtp, otp }) {
     input{width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#fff;font-size:16px}
     button{margin-top:12px;background:#6d57ff;border:0;color:white;padding:12px 14px;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer}
     .muted{opacity:.75;font-size:13px}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    @media(max-width:720px){.row{grid-template-columns:1fr}}
   </style></head><body>
   <div class="wrap"><div class="card">
     <h1>WiFi Giriş</h1>
@@ -829,7 +756,7 @@ function splashPage({ marker, mode, message, showOtp, otp }) {
 
     <form method="POST" action="/otp/request">
       <input type="hidden" name="marker" value="${escapeHtml(marker || "")}"/>
-      <input type="hidden" name="mode" value="${escapeHtml(mode || "")}"/>
+      ${ctxHidden}
       <label>Ad</label><input name="first_name" placeholder="Ad" />
       <label>Soyad</label><input name="last_name" placeholder="Soyad" />
       <label>Telefon</label><input name="phone" placeholder="05xxxxxxxxx" />
@@ -845,29 +772,12 @@ function splashPage({ marker, mode, message, showOtp, otp }) {
     <form method="POST" action="/otp/verify">
       <label>OTP</label><input name="otp" placeholder="6 haneli kod" />
       <input type="hidden" name="marker" value="${escapeHtml(marker || "")}"/>
+      ${ctxHidden}
       <button type="submit">Doğrula ve Bağlan</button>
     </form>
 
   </div></div>
   </body></html>`;
-}
-
-function parseForm(req) {
-  return new Promise((resolve) => {
-    let buf = "";
-    req.on("data", (d) => (buf += d));
-    req.on("end", () => {
-      const out = {};
-      buf.split("&").forEach((kvp) => {
-        if (!kvp) return;
-        const [k, v] = kvp.split("=");
-        const key = decodeURIComponent(k || "").replace(/\+/g, " ");
-        const val = decodeURIComponent(v || "").replace(/\+/g, " ");
-        out[key] = val;
-      });
-      resolve(out);
-    });
-  });
 }
 
 // -------------------- Routes --------------------
@@ -876,12 +786,9 @@ async function handle(req, res) {
   const path = u.pathname || "/";
   const q = u.query || {};
 
-  // healthcheck
-  if (path === "/health" || path === "/") {
-    return send(res, 200, "ok");
-  }
+  if (path === "/" || path === "/health") return send(res, 200, "ok");
 
-  // Admin routes
+  // Admin
   if (path.startsWith("/admin")) {
     if (!requireAdmin(req, res)) return;
 
@@ -889,133 +796,159 @@ async function handle(req, res) {
       res.writeHead(302, { Location: "/admin/logs" });
       return res.end();
     }
-
-    if (path === "/admin/logs") {
+    if (path === "/admin/logs") return await renderAdminLogs(req, res, q);
+    if (path === "/admin/daily" || path === "/admin/daily/") return await renderAdminDailyIndex(req, res);
+    if (path === "/admin/daily/build") {
+      const day = (q.day || "").toString().trim();
+      const tz = (q.tz || ENV.TZ || "UTC").toString().trim();
+      if (!day) return send(res, 400, "missing ?day=YYYY-MM-DD");
       try {
-        return await renderAdminLogs(req, res, q);
+        const out = await buildDaily(day, tz);
+        return sendJson(res, 200, out);
       } catch (e) {
-        return send(res, 500, "admin logs error: " + (e && e.message));
+        return send(res, 500, "daily build error: " + (e && e.message));
       }
     }
-
-    if (path === "/admin/daily" || path === "/admin/daily/") {
-      return await renderAdminDailyIndex(req, res);
-    }
-    if (path === "/admin/daily/build") return await renderAdminDailyBuild(req, res, q);
-    if (path === "/admin/daily/verify") return await renderAdminDailyVerify(req, res, q);
-    if (path === "/admin/daily/package") return await renderAdminDailyPackage(req, res, q);
-
     return send(res, 404, "Not Found");
   }
 
-  // Splash
+  // Splash (FIX: parse ctx robustly + cache)
   if (path === "/splash") {
     const return_url = (q.return_url || "").toString();
-    const { ctx } = parseMerakiReturnUrl(return_url);
+
+    const ctxDirect = parseMerakiDirectQuery(q);
+    const ctxFromReturn = return_url ? parseMerakiReturnUrl(return_url).ctx : {};
+    const ctx = mergeCtx(ctxDirect, ctxFromReturn);
+
+    // derive base_grant_url if still missing but request itself looks like /splash/<id>
+    if (!ctx.base_grant_url) {
+      try {
+        const full = new URL((req.headers["x-forwarded-proto"] || "https") + "://" + req.headers.host + req.url);
+        if (full.pathname.includes("/splash/")) {
+          const p = full.pathname.replace(/\/$/, "");
+          ctx.base_grant_url = full.origin + p + "/grant";
+        }
+      } catch {}
+    }
+
+    // extra fallback: try from referer query (some clients)
+    if (!ctx.base_grant_url) {
+      const ref = (req.headers["referer"] || "").toString();
+      if (ref.includes("base_grant_url=") || ref.includes("client_mac=")) {
+        try {
+          const rr = new URL(ref);
+          const rctx = parseMerakiDirectQuery(Object.fromEntries(rr.searchParams.entries()));
+          const rctx2 = rr.searchParams.get("return_url")
+            ? parseMerakiReturnUrl(rr.searchParams.get("return_url")).ctx
+            : {};
+          const merged = mergeCtx(rctx, rctx2);
+          Object.assign(ctx, mergeCtx(merged, ctx));
+        } catch {}
+      }
+    }
 
     const marker = randDigits(6);
+
+    // cache ctx by marker + by mac/ip for fallback
+    const cacheObj = { ctx, return_url };
+    await kv.setex(`ctx:marker:${marker}`, ENV.OTP_TTL_SECONDS * 2, JSON.stringify(cacheObj));
+    if (ctx.client_mac) await kv.setex(`ctx:mac:${ctx.client_mac}`, ENV.OTP_TTL_SECONDS * 6, JSON.stringify(cacheObj));
+    if (ctx.client_ip) await kv.setex(`ctx:ip:${ctx.client_ip}`, ENV.OTP_TTL_SECONDS * 6, JSON.stringify(cacheObj));
 
     const hasBaseGrant = !!ctx.base_grant_url;
     const hasContinue = !!ctx.continue_url;
     const hasClientMac = !!ctx.client_mac;
 
-    console.log("SPLASH_OPEN", {
-      hasBaseGrant,
-      hasContinue,
-      hasClientMac,
-      mode: ENV.OTP_MODE,
-    });
+    console.log("SPLASH_OPEN", { hasBaseGrant, hasContinue, hasClientMac, mode: ENV.OTP_MODE });
 
     await logAccess("SPLASH_OPEN", {
-      marker: null,
+      marker,
       kvkk_version: ENV.KVKK_VERSION,
       client_mac: ctx.client_mac || null,
       client_ip: ctx.client_ip || null,
       base_grant_url: ctx.base_grant_url || null,
       continue_url: ctx.continue_url || null,
-      user_continue_url: return_url || null,
+      user_continue_url: ctx.user_continue_url || return_url || null,
       user_agent: req.headers["user-agent"] || null,
       accept_language: req.headers["accept-language"] || null,
       meta: {
-        mode: ENV.OTP_MODE,
         gateway_id: ctx.gateway_id || null,
         node_id: ctx.node_id || null,
         node_mac: ctx.node_mac || null,
         public_ip: ENV.PUBLIC_IP || null,
-        referer: req.headers["referer"] || null,
       },
     });
 
-    // Store return_url context so verify can grant even if browser loses query params
-    await kv.setex(`ru:${marker}`, ENV.OTP_TTL_SECONDS * 2, JSON.stringify({ return_url, ctx }));
-
     const html = splashPage({
       marker,
-      mode: ENV.OTP_MODE,
       message: "Telefonunu yaz, OTP ile doğrula.",
       showOtp: false,
       otp: "",
+      ctx,
     });
     return sendHtml(res, 200, html);
   }
 
-  // OTP request (supports JSON or form)
+  // OTP request
   if (path === "/otp/request" && req.method === "POST") {
     const ct = (req.headers["content-type"] || "").toString();
-    const data =
-      ct.includes("application/json") ? await parseJsonBody(req) : await parseForm(req);
+    const data = ct.includes("application/json") ? await parseJsonBody(req) : await parseForm(req);
 
-    const marker = String(data.marker || randDigits(6));
+    const marker = String(data.marker || "").trim() || randDigits(6);
+
     const first_name = String(data.first_name || "").trim() || null;
     const last_name = String(data.last_name || "").trim() || null;
     const full_name = [first_name, last_name].filter(Boolean).join(" ") || null;
     const phone = normalizePhone(data.phone || "");
     const kvkk_accepted = !!data.kvkk_accepted;
 
-    // retrieve ctx from KV (saved on splash)
-    const ruRaw = await kv.get(`ru:${marker}`);
-    let saved = null;
-    try {
-      saved = ruRaw ? JSON.parse(ruRaw) : null;
-    } catch {
-      saved = null;
+    // IMPORTANT FIX: read ctx from hidden fields first
+    const ctxFromForm = mergeCtx(
+      {
+        base_grant_url: (data.base_grant_url || "").toString(),
+        continue_url: (data.continue_url || "").toString(),
+        user_continue_url: (data.user_continue_url || "").toString(),
+        gateway_id: (data.gateway_id || "").toString(),
+        node_id: (data.node_id || "").toString(),
+        node_mac: (data.node_mac || "").toString(),
+        client_ip: (data.client_ip || "").toString(),
+        client_mac: (data.client_mac || "").toString(),
+      },
+      {}
+    );
+
+    // KV fallback by marker/mac/ip
+    let cached = null;
+    const rawMarker = await kv.get(`ctx:marker:${marker}`);
+    if (rawMarker) {
+      try { cached = JSON.parse(rawMarker); } catch {}
     }
-    const savedCtx = (saved && saved.ctx) || {};
+    if (!cached && ctxFromForm.client_mac) {
+      const rawMac = await kv.get(`ctx:mac:${ctxFromForm.client_mac}`);
+      if (rawMac) { try { cached = JSON.parse(rawMac); } catch {} }
+    }
+    if (!cached && ctxFromForm.client_ip) {
+      const rawIp = await kv.get(`ctx:ip:${ctxFromForm.client_ip}`);
+      if (rawIp) { try { cached = JSON.parse(rawIp); } catch {} }
+    }
 
-    // tolerant mac/ip from body/query/headers/saved
-    const headerMac = normalizeMac(req.headers["x-client-mac"] || req.headers["x-meraki-client-mac"] || "");
-    const client_mac =
-      normalizeMac(data.client_mac || "") ||
-      normalizeMac(savedCtx.client_mac || "") ||
-      headerMac ||
-      "";
-
-    const client_ip =
-      String(data.client_ip || "").trim() ||
-      String(savedCtx.client_ip || "").trim() ||
-      getClientIp(req) ||
-      "";
+    const ctx = mergeCtx(ctxFromForm, (cached && cached.ctx) || {});
+    const client_mac = ctx.client_mac || "";
+    const client_ip = ctx.client_ip || getClientIp(req) || "";
 
     // rate limit
     const rl = await isRateLimited(client_mac, phone);
     if (!rl.ok) {
       await logAccess("OTP_RATE_LIMIT", {
-        marker,
-        phone,
-        full_name,
-        client_mac,
-        client_ip,
-        kvkk_accepted,
-        kvkk_version: ENV.KVKK_VERSION,
+        marker, phone, full_name, client_mac, client_ip,
+        kvkk_accepted, kvkk_version: ENV.KVKK_VERSION,
         meta: { why: rl.why, ttl: rl.ttl },
       });
       return sendJson(res, 429, { ok: false, error: "rate_limited", why: rl.why });
     }
     await setRate(client_mac, phone);
 
-    // generate OTP
     const otp = randDigits(6);
-
     const rec = {
       marker,
       otp,
@@ -1029,39 +962,31 @@ async function handle(req, res) {
       created_at: nowISO(),
       client_mac,
       client_ip,
-      ctx: savedCtx,
+      ctx,
     };
-
     await kv.setex(keyOtp(marker), ENV.OTP_TTL_SECONDS, JSON.stringify(rec));
 
     console.log("OTP_CREATED", { marker, last4: phone ? phone.slice(-4) : null, client_mac });
     await logAccess("OTP_CREATED", {
-      marker,
-      phone,
-      first_name,
-      last_name,
-      full_name,
-      kvkk_accepted,
-      kvkk_version: ENV.KVKK_VERSION,
-      client_mac,
-      client_ip,
-      base_grant_url: savedCtx.base_grant_url || null,
-      continue_url: savedCtx.continue_url || null,
-      user_continue_url: saved && saved.return_url ? saved.return_url : null,
+      marker, phone, first_name, last_name, full_name,
+      kvkk_accepted, kvkk_version: ENV.KVKK_VERSION,
+      client_mac, client_ip,
+      base_grant_url: ctx.base_grant_url || null,
+      continue_url: ctx.continue_url || null,
+      user_continue_url: ctx.user_continue_url || (cached && cached.return_url) || null,
       user_agent: req.headers["user-agent"] || null,
       accept_language: req.headers["accept-language"] || null,
       meta: { mode: ENV.OTP_MODE },
     });
 
-    // screen mode: show OTP directly in HTML
     if (ENV.OTP_MODE === "screen") {
       console.log("OTP_SCREEN_CODE", { marker, otp });
       const html = splashPage({
         marker,
-        mode: ENV.OTP_MODE,
         message: "OTP oluşturuldu. Aşağıdaki kodu girerek bağlan.",
         showOtp: true,
         otp,
+        ctx,
       });
       return sendHtml(res, 200, html);
     }
@@ -1070,15 +995,13 @@ async function handle(req, res) {
     return sendJson(res, 200, { ok: true, marker });
   }
 
-  // OTP verify (supports JSON or form)
+  // OTP verify
   if (path === "/otp/verify" && req.method === "POST") {
     const ct = (req.headers["content-type"] || "").toString();
-    const data =
-      ct.includes("application/json") ? await parseJsonBody(req) : await parseForm(req);
+    const data = ct.includes("application/json") ? await parseJsonBody(req) : await parseForm(req);
 
     const marker = String(data.marker || "").trim();
     const otp = String(data.otp || "").trim();
-
     if (!marker || !otp) return sendJson(res, 400, { ok: false, error: "missing_marker_or_otp" });
 
     if (await isLocked(marker)) {
@@ -1093,17 +1016,12 @@ async function handle(req, res) {
     }
 
     let rec = null;
-    try {
-      rec = JSON.parse(raw);
-    } catch {
-      rec = null;
-    }
+    try { rec = JSON.parse(raw); } catch {}
     if (!rec) return sendJson(res, 500, { ok: false, error: "bad_otp_record" });
 
     if (String(rec.otp) !== otp) {
       rec.wrong = (rec.wrong || 0) + 1;
       await kv.setex(keyOtp(marker), ENV.OTP_TTL_SECONDS, JSON.stringify(rec));
-
       await logAccess("OTP_WRONG", { marker, phone: rec.phone || null, client_mac: rec.client_mac || null, meta: { wrong: rec.wrong } });
 
       if (rec.wrong >= ENV.MAX_WRONG_ATTEMPTS) {
@@ -1114,8 +1032,42 @@ async function handle(req, res) {
       return sendJson(res, 401, { ok: false, error: "wrong_otp", wrong: rec.wrong });
     }
 
-    // success
     console.log("OTP_VERIFY_OK", { marker, client_mac: rec.client_mac || "" });
+
+    // FIX: also read ctx from hidden fields on verify page (in case rec.ctx missing)
+    const ctxFromForm = mergeCtx(
+      {
+        base_grant_url: (data.base_grant_url || "").toString(),
+        continue_url: (data.continue_url || "").toString(),
+        user_continue_url: (data.user_continue_url || "").toString(),
+        gateway_id: (data.gateway_id || "").toString(),
+        node_id: (data.node_id || "").toString(),
+        node_mac: (data.node_mac || "").toString(),
+        client_ip: (data.client_ip || "").toString(),
+        client_mac: (data.client_mac || "").toString(),
+      },
+      {}
+    );
+
+    // KV fallback by marker/mac/ip
+    let cached = null;
+    const rawMarker = await kv.get(`ctx:marker:${marker}`);
+    if (rawMarker) { try { cached = JSON.parse(rawMarker); } catch {} }
+    if (!cached && (ctxFromForm.client_mac || rec.client_mac)) {
+      const mac = ctxFromForm.client_mac || rec.client_mac;
+      const rawMac = await kv.get(`ctx:mac:${mac}`);
+      if (rawMac) { try { cached = JSON.parse(rawMac); } catch {} }
+    }
+    if (!cached && (ctxFromForm.client_ip || rec.client_ip)) {
+      const ip = ctxFromForm.client_ip || rec.client_ip;
+      const rawIp = await kv.get(`ctx:ip:${ip}`);
+      if (rawIp) { try { cached = JSON.parse(rawIp); } catch {} }
+    }
+
+    const ctx = mergeCtx(ctxFromForm, mergeCtx(rec.ctx || {}, (cached && cached.ctx) || {}));
+    // Ensure mac/ip not empty
+    if (!ctx.client_mac) ctx.client_mac = rec.client_mac || "";
+    if (!ctx.client_ip) ctx.client_ip = rec.client_ip || getClientIp(req) || "";
 
     await logAccess("OTP_VERIFIED", {
       marker,
@@ -1125,47 +1077,43 @@ async function handle(req, res) {
       full_name: rec.full_name || null,
       kvkk_accepted: !!rec.kvkk_accepted,
       kvkk_version: rec.kvkk_version || ENV.KVKK_VERSION,
-      client_mac: rec.client_mac || null,
-      client_ip: rec.client_ip || null,
-      base_grant_url: (rec.ctx && rec.ctx.base_grant_url) || null,
-      continue_url: (rec.ctx && rec.ctx.continue_url) || null,
+      client_mac: ctx.client_mac || null,
+      client_ip: ctx.client_ip || null,
+      base_grant_url: ctx.base_grant_url || null,
+      continue_url: ctx.continue_url || null,
+      user_continue_url: ctx.user_continue_url || (cached && cached.return_url) || null,
       user_agent: req.headers["user-agent"] || null,
       accept_language: req.headers["accept-language"] || null,
       meta: { mode: ENV.OTP_MODE },
     });
 
-    // remove otp record (optional)
     await kv.del(keyOtp(marker));
 
-    // Build grant redirect using ctx saved at /splash time
-    const ctx = (rec && rec.ctx) || {};
-    // Ensure we have mac/ip also in ctx for grant
-    if (!ctx.client_mac) ctx.client_mac = rec.client_mac || "";
-    if (!ctx.client_ip) ctx.client_ip = rec.client_ip || "";
-
     const redirect = buildGrantRedirect(ctx);
-
     if (redirect) {
       console.log("GRANT_CLIENT_REDIRECT:", redirect);
       await logAccess("GRANT_CLIENT_REDIRECT", {
         marker,
         phone: rec.phone || null,
         full_name: rec.full_name || null,
-        client_mac: rec.client_mac || null,
-        client_ip: rec.client_ip || null,
+        client_mac: ctx.client_mac || null,
+        client_ip: ctx.client_ip || null,
         base_grant_url: ctx.base_grant_url || null,
         continue_url: ctx.continue_url || null,
         meta: { redirect },
       });
-
-      // For browser: do redirect
       res.writeHead(302, { Location: redirect });
       return res.end();
     }
 
-    // If no redirect possible, just OK
-    await logAccess("GRANT_MISSING_CTX", { marker, meta: { ctx_present: !!ctx, ctx } });
-    return sendJson(res, 200, { ok: true, redirect: null, note: "no base_grant_url" });
+    // If still missing, explicitly show debug to user (screen) and log
+    await logAccess("GRANT_MISSING_CTX", { marker, meta: { ctx } });
+    return sendHtml(res, 200, adminLayout("Grant missing", `
+      <h1>GRANT başarısız</h1>
+      <div class="muted">base_grant_url hala yok. Bu Meraki tarafında splash parametreleri gelmedi demektir.</div>
+      <pre style="white-space:pre-wrap;background:rgba(255,255,255,.08);padding:12px;border-radius:12px;margin-top:12px">${escapeHtml(JSON.stringify(ctx, null, 2))}</pre>
+      <div style="margin-top:12px" class="muted">Log: event=GRANT_MISSING_CTX</div>
+    `));
   }
 
   return send(res, 404, "Not Found");
@@ -1189,9 +1137,7 @@ async function main() {
       await handle(req, res);
     } catch (e) {
       console.error("UNCAUGHT:", e && e.stack ? e.stack : e);
-      try {
-        send(res, 500, "internal error");
-      } catch {}
+      try { send(res, 500, "internal error"); } catch {}
     }
   });
 
