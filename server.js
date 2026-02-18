@@ -1,187 +1,227 @@
-import express from "express";
-import crypto from "crypto";
-import { Pool } from "pg";
-import Redis from "ioredis";
+"use strict";
 
-// =========================
-// ENV
-// =========================
-const PORT = Number(process.env.PORT || 8080);
-const TZ = process.env.TZ || "Europe/Istanbul";
+/**
+ * Meraki Splash + OTP (screen) + 5651 log (Postgres) + Daily hash chain (HMAC)
+ * - CommonJS (require) => "Cannot use import outside a module" hatası biter.
+ * - Redis opsiyonel: REDIS_URL varsa kullanır, yoksa memory fallback.
+ * - Postgres zorunlu: DATABASE_URL varsa 5651 log + daily çalışır (yoksa sadece splash).
+ *
+ * ENV (Railway Variables):
+ *   PORT=8080 (Railway otomatik)
+ *   TZ=Europe/Istanbul
+ *   ADMIN_USER=...
+ *   ADMIN_PASS=...
+ *   DATABASE_URL=... (Railway Postgres reference)
+ *   REDIS_URL=... (Railway Redis reference) [opsiyonel]
+ *   OTP_MODE=screen
+ *   OTP_TTL_SECONDS=180
+ *   KVKK_VERSION=2026-02-12-placeholder
+ *   DAILY_HMAC_SECRET=... (5651 günlük imza için zorunlu önerilir)
+ *   BRAND_NAME=Odeon Technology
+ *   BRAND_LOGO_URL=https://.../logo.svg (opsiyonel)
+ */
 
-const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen | sms (sms daha sonra)
-const OTP_TTL_SECONDS = Number(process.env.OTP_TTL_SECONDS || 180);
+const express = require("express");
+const crypto = require("crypto");
+const { Pool } = require("pg");
 
-const RL_MAC_SECONDS = Number(process.env.RL_MAC_SECONDS || 30);
-const RL_PHONE_SECONDS = Number(process.env.RL_PHONE_SECONDS || 60);
+let Redis = null;
+try {
+  Redis = require("ioredis");
+} catch (_) {
+  Redis = null;
+}
 
-const MAX_WRONG_ATTEMPTS = Number(process.env.MAX_WRONG_ATTEMPTS || 5);
-const LOCK_SECONDS = Number(process.env.LOCK_SECONDS || 600);
+process.env.TZ = process.env.TZ || "Europe/Istanbul";
+
+const app = express();
+app.disable("x-powered-by");
+app.use(express.urlencoded({ extended: false, limit: "64kb" }));
+app.use(express.json({ limit: "128kb" }));
+
+// -------------------- ENV --------------------
+const PORT = parseInt(process.env.PORT || "8080", 10);
+
+const OTP_MODE = (process.env.OTP_MODE || "screen").toLowerCase(); // screen | sms (sms sonra)
+const OTP_TTL_SECONDS = clampInt(process.env.OTP_TTL_SECONDS, 180, 30, 600);
+const RL_MAC_SECONDS = clampInt(process.env.RL_MAC_SECONDS, 30, 5, 600);
+const RL_PHONE_SECONDS = clampInt(process.env.RL_PHONE_SECONDS, 60, 5, 600);
+const MAX_WRONG_ATTEMPTS = clampInt(process.env.MAX_WRONG_ATTEMPTS, 5, 1, 20);
+const LOCK_SECONDS = clampInt(process.env.LOCK_SECONDS, 600, 60, 3600);
 
 const KVKK_VERSION = process.env.KVKK_VERSION || "2026-02-12-placeholder";
 
 const ADMIN_USER = process.env.ADMIN_USER || "";
 const ADMIN_PASS = process.env.ADMIN_PASS || "";
 
-const DAILY_HMAC_KEY = process.env.DAILY_HMAC_KEY || ""; // 5651 imza için önerilir (zorunlu değil ama önerilir)
+const BRAND_NAME = process.env.BRAND_NAME || "Odeon Technology";
+const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || ""; // opsiyonel
 
-// Railway Postgres genelde DATABASE_URL verir
-const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.PG_URL || "";
+const DAILY_HMAC_SECRET = process.env.DAILY_HMAC_SECRET || ""; // önerilir (5651)
+const DB_URL = process.env.DATABASE_URL || "";
+const REDIS_URL = process.env.REDIS_URL || "";
 
-// Redis
-const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PUBLIC_URL || "";
+// -------------------- Helpers --------------------
+function clampInt(v, def, min, max) {
+  const n = parseInt(String(v ?? ""), 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, n));
+}
 
-// =========================
-// Helpers
-// =========================
-function nowIso() {
+function nowISO() {
   return new Date().toISOString();
 }
 
-function safeStr(v) {
-  if (v === undefined || v === null) return "";
-  return String(v);
-}
-
-function sanitizePhoneTR(raw) {
-  // Beklenen: 5XXXXXXXXX (10 hane, 0 yok, +90 yok)
-  const digits = safeStr(raw).replace(/\D/g, "");
-  if (digits.length === 10 && digits.startsWith("5")) return digits;
-  // 0 ile geldiyse 0'ı at (05xxxxxxxxx)
-  if (digits.length === 11 && digits.startsWith("05")) return digits.slice(1);
-  // +90 ile geldiyse
-  if (digits.length === 12 && digits.startsWith("90") && digits.slice(2).startsWith("5")) return digits.slice(2);
-  return ""; // invalid
-}
-
-function maskLast4(s) {
-  const v = safeStr(s);
-  if (!v) return null;
-  return v.length >= 4 ? v.slice(-4) : v;
-}
-
-function randMarker() {
-  // 6 haneli marker (log takip)
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-function randOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
 function sha256Hex(s) {
-  return crypto.createHash("sha256").update(s).digest("hex");
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
 }
 
 function hmacHex(key, s) {
-  return crypto.createHmac("sha256", key).update(s).digest("hex");
+  return crypto.createHmac("sha256", String(key)).update(String(s)).digest("hex");
 }
 
-function basicAuthMiddleware(req, res, next) {
-  // Eğer admin creds yoksa admin ekranını kapat
-  if (!ADMIN_USER || !ADMIN_PASS) {
-    return res.status(403).send("Admin disabled (ADMIN_USER / ADMIN_PASS not set).");
-  }
+function randDigits(len) {
+  let out = "";
+  while (out.length < len) out += String(Math.floor(Math.random() * 10));
+  return out.slice(0, len);
+}
 
-  const hdr = req.headers["authorization"] || "";
-  if (!hdr.startsWith("Basic ")) {
-    res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
-    return res.status(401).send("Auth required");
-  }
-  const b64 = hdr.slice(6).trim();
+function safeLast4(s) {
+  if (!s) return null;
+  const t = String(s).replace(/\D/g, "");
+  if (t.length < 4) return null;
+  return t.slice(-4);
+}
+
+function cleanPhoneTR10(s) {
+  // beklenen: 5XXXXXXXXX (10 hane)
+  const t = String(s || "").replace(/\D/g, "");
+  if (t.length === 10 && t.startsWith("5")) return t;
+  // bazen 0 ile geliyor: 05XXXXXXXXX
+  if (t.length === 11 && t.startsWith("05")) return t.slice(1);
+  // bazen 90 ile geliyor: 90 5XXXXXXXXX
+  if (t.length === 12 && t.startsWith("90") && t[2] === "5") return t.slice(2);
+  return "";
+}
+
+function parseBasicAuth(req) {
+  const h = req.headers["authorization"];
+  if (!h || typeof h !== "string") return null;
+  const m = h.match(/^Basic\s+(.+)$/i);
+  if (!m) return null;
   let decoded = "";
   try {
-    decoded = Buffer.from(b64, "base64").toString("utf8");
+    decoded = Buffer.from(m[1], "base64").toString("utf8");
   } catch {
-    res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
-    return res.status(401).send("Auth required");
+    return null;
   }
   const idx = decoded.indexOf(":");
-  const u = idx >= 0 ? decoded.slice(0, idx) : decoded;
-  const p = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (u !== ADMIN_USER || p !== ADMIN_PASS) {
+  if (idx < 0) return null;
+  return { user: decoded.slice(0, idx), pass: decoded.slice(idx + 1) };
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_USER || !ADMIN_PASS) {
+    return res.status(500).send("ADMIN_USER / ADMIN_PASS not configured");
+  }
+  const creds = parseBasicAuth(req);
+  if (!creds || creds.user !== ADMIN_USER || creds.pass !== ADMIN_PASS) {
     res.setHeader("WWW-Authenticate", 'Basic realm="admin"');
-    return res.status(401).send("Auth required");
+    return res.status(401).send("Unauthorized");
   }
   next();
 }
 
-// =========================
-// Redis
-// =========================
+function getClientIp(req) {
+  // X-Forwarded-For ilk IP
+  const xff = req.headers["x-forwarded-for"];
+  if (xff && typeof xff === "string") {
+    const ip = xff.split(",")[0].trim();
+    return ip || "";
+  }
+  return (req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress) : "";
+}
+
+// -------------------- Redis (optional) + Memory fallback --------------------
+const memStore = new Map(); // key => { val, exp }
+
+function memSet(key, val, ttlSec) {
+  memStore.set(key, { val, exp: Date.now() + ttlSec * 1000 });
+}
+function memGet(key) {
+  const it = memStore.get(key);
+  if (!it) return null;
+  if (Date.now() > it.exp) {
+    memStore.delete(key);
+    return null;
+  }
+  return it.val;
+}
+function memDel(key) {
+  memStore.delete(key);
+}
+
 let redis = null;
-
-async function initRedis() {
-  if (!REDIS_URL) {
-    console.log("REDIS: not configured (REDIS_URL / REDIS_PUBLIC_URL missing). Running WITHOUT persistent store.");
-    return null;
-  }
+if (Redis && REDIS_URL) {
   try {
-    const r = new Redis(REDIS_URL, {
-      maxRetriesPerRequest: 1,
-      enableOfflineQueue: false,
-      lazyConnect: true
-    });
-    await r.connect();
+    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
+    redis.on("error", (e) => console.log("REDIS_ERROR:", e && e.message ? e.message : e));
     console.log("REDIS: connected");
-    return r;
   } catch (e) {
-    console.log("REDIS: failed to connect, running WITHOUT store. err=", e?.message || e);
-    return null;
+    console.log("REDIS: failed, fallback to memory:", e.message);
+    redis = null;
   }
+} else {
+  console.log("REDIS: not configured. Running WITHOUT persistent store.");
 }
 
-async function rGet(key) {
-  if (!redis) return null;
-  return await redis.get(key);
-}
-async function rSet(key, val, ttlSec) {
-  if (!redis) return;
-  if (ttlSec) await redis.set(key, val, "EX", ttlSec);
-  else await redis.set(key, val);
-}
-async function rDel(key) {
-  if (!redis) return;
-  await redis.del(key);
-}
-async function rIncrWithTTL(key, ttlSec) {
-  if (!redis) return 1;
-  const n = await redis.incr(key);
-  if (n === 1) await redis.expire(key, ttlSec);
-  return n;
+async function kvSet(key, val, ttlSec) {
+  if (redis) {
+    await redis.set(key, JSON.stringify(val), "EX", ttlSec);
+    return;
+  }
+  memSet(key, val, ttlSec);
 }
 
-// =========================
-// Postgres
-// =========================
+async function kvGet(key) {
+  if (redis) {
+    const raw = await redis.get(key);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  }
+  return memGet(key);
+}
+
+async function kvDel(key) {
+  if (redis) {
+    await redis.del(key);
+    return;
+  }
+  memDel(key);
+}
+
+// -------------------- Postgres (5651 logs + daily) --------------------
 let pool = null;
 
-async function initDb() {
-  if (!DATABASE_URL) {
-    console.log("DATABASE: not configured (DATABASE_URL missing). Running WITHOUT DB logs.");
-    return null;
-  }
-  const p = new Pool({
-    connectionString: DATABASE_URL,
-    max: 5,
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 10_000,
-  });
-  // test
-  await p.query("SELECT 1;");
+if (DB_URL) {
+  pool = new Pool({ connectionString: DB_URL, max: 5, idleTimeoutMillis: 30000 });
+  pool.on("error", (e) => console.log("PG_POOL_ERROR:", e && e.message ? e.message : e));
   console.log("DATABASE: connected");
-  return p;
+} else {
+  console.log("DATABASE: not configured (DATABASE_URL missing). 5651 logs disabled.");
 }
 
 async function q(sql, params = []) {
   if (!pool) return { rows: [] };
-  return await pool.query(sql, params);
+  const r = await pool.query(sql, params);
+  return r;
 }
 
-async function ensureSchema() {
+async function ensureDb() {
   if (!pool) return;
 
-  // access_logs (5651)
+  // access_logs: text kolonlar (sen "text" demiştin) -> inet yok.
+  // daily_summaries: gün bazlı hash zinciri
   await q(`
     CREATE TABLE IF NOT EXISTS access_logs (
       id BIGSERIAL PRIMARY KEY,
@@ -193,817 +233,818 @@ async function ensureSchema() {
       ap_name TEXT,
       base_grant_url TEXT,
       continue_url TEXT,
-      grant_url TEXT,
       marker TEXT,
       phone TEXT,
       full_name TEXT,
       kvkk_version TEXT,
-      user_agent TEXT,
       accept_language TEXT,
+      user_agent TEXT,
       tz TEXT,
-      meta JSONB
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
 
-  // Bazı ortamda eski tabloyla gelmiş olabilir -> missing kolonları ekle
-  const addCols = [
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS continue_url TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS grant_url TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS user_agent TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS accept_language TEXT;`,
-    `ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS tz TEXT;`,
-  ];
-  for (const s of addCols) {
-    try { await q(s); } catch {}
-  }
-
-  await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at);`);
-  await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_phone ON access_logs(phone);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at DESC);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_mac ON access_logs(client_mac);`);
-  await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_client_ip ON access_logs(client_ip);`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_phone ON access_logs(phone);`);
   await q(`CREATE INDEX IF NOT EXISTS idx_access_logs_event ON access_logs(event);`);
 
-  // daily chain (hash + hmac + zincir)
   await q(`
-    CREATE TABLE IF NOT EXISTS daily_chains (
+    CREATE TABLE IF NOT EXISTS daily_summaries (
       day DATE PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      record_count INT NOT NULL,
-      payload_sha256 TEXT NOT NULL,
-      prev_sha256 TEXT,
-      hmac_sha256 TEXT,
-      payload_json JSONB,
-      payload_text TEXT
+      tz TEXT NOT NULL,
+      count_total BIGINT NOT NULL,
+      count_verify_ok BIGINT NOT NULL,
+      count_grant_ok BIGINT NOT NULL,
+      hash_prev TEXT,
+      hash_curr TEXT NOT NULL,
+      hmac_sig TEXT NOT NULL
     );
   `);
 
   console.log("DATABASE: table ready");
 }
 
-async function dbLog(event, ctx = {}) {
+async function dbLog(ev, data) {
   if (!pool) return;
-
-  const {
-    client_mac = "",
-    client_ip = "",
-    ssid = "",
-    ap_name = "",
-    base_grant_url = "",
-    continue_url = "",
-    grant_url = "",
-    marker = "",
-    phone = "",
-    full_name = "",
-    kvkk_version = KVKK_VERSION,
-    user_agent = "",
-    accept_language = "",
-    tz = TZ,
-    meta = {},
-  } = ctx;
-
   try {
+    const meta = data && data.meta ? data.meta : {};
     await q(
-      `INSERT INTO access_logs(event, client_mac, client_ip, ssid, ap_name, base_grant_url, continue_url, grant_url, marker, phone, full_name, kvkk_version, user_agent, accept_language, tz, meta)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)`,
+      `INSERT INTO access_logs
+        (event, client_mac, client_ip, ssid, ap_name, base_grant_url, continue_url, marker, phone, full_name, kvkk_version, accept_language, user_agent, tz, meta)
+       VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)`,
       [
-        event,
-        safeStr(client_mac) || null,
-        safeStr(client_ip) || null,
-        safeStr(ssid) || null,
-        safeStr(ap_name) || null,
-        safeStr(base_grant_url) || null,
-        safeStr(continue_url) || null,
-        safeStr(grant_url) || null,
-        safeStr(marker) || null,
-        safeStr(phone) || null,
-        safeStr(full_name) || null,
-        safeStr(kvkk_version) || null,
-        safeStr(user_agent) || null,
-        safeStr(accept_language) || null,
-        safeStr(tz) || null,
+        String(ev),
+        data.client_mac || null,
+        data.client_ip || null,
+        data.ssid || null,
+        data.ap_name || null,
+        data.base_grant_url || null,
+        data.continue_url || null,
+        data.marker || null,
+        data.phone || null,
+        data.full_name || null,
+        data.kvkk_version || KVKK_VERSION,
+        data.accept_language || null,
+        data.user_agent || null,
+        data.tz || process.env.TZ || "Europe/Istanbul",
         JSON.stringify(meta || {}),
       ]
     );
   } catch (e) {
-    console.log("DB LOG ERROR:", e?.message || e);
+    console.log("DB LOG ERROR:", e.message || e);
   }
 }
 
-// =========================
-// OTP Store
-// =========================
-function otpKey(marker) { return `otp:${marker}`; }
-function lockMacKey(mac) { return `lock:mac:${mac}`; }
-function lockPhoneKey(ph) { return `lock:ph:${ph}`; }
-function rlMacKey(mac) { return `rl:mac:${mac}`; }
-function rlPhoneKey(ph) { return `rl:ph:${ph}`; }
-function wrongKey(marker) { return `wrong:${marker}`; }
+// -------------------- Meraki Splash parse --------------------
+function extractMerakiParams(req) {
+  // Meraki genelde querystring ile gelir
+  const q = req.query || {};
+  const base_grant_url = q.base_grant_url ? String(q.base_grant_url) : "";
+  const continue_url = q.continue_url ? String(q.continue_url) : "";
+  const client_ip = q.client_ip ? String(q.client_ip) : "";
+  const client_mac = q.client_mac ? String(q.client_mac) : "";
+  const node_mac = q.node_mac ? String(q.node_mac) : "";
+  const gateway_id = q.gateway_id ? String(q.gateway_id) : "";
+  const node_id = q.node_id ? String(q.node_id) : "";
 
-async function isLocked(mac, phone) {
-  const m = mac ? await rGet(lockMacKey(mac)) : null;
-  const p = phone ? await rGet(lockPhoneKey(phone)) : null;
-  return Boolean(m || p);
+  return { base_grant_url, continue_url, client_ip, client_mac, node_mac, gateway_id, node_id };
 }
 
-async function bumpWrong(marker, mac, phone) {
-  const n = await rIncrWithTTL(wrongKey(marker), LOCK_SECONDS);
-  if (n >= MAX_WRONG_ATTEMPTS) {
-    if (mac) await rSet(lockMacKey(mac), "1", LOCK_SECONDS);
-    if (phone) await rSet(lockPhoneKey(phone), "1", LOCK_SECONDS);
+function splashContext(req) {
+  const m = extractMerakiParams(req);
+  const hasBaseGrant = !!m.base_grant_url;
+  const hasContinue = !!m.continue_url;
+  const hasClientMac = !!m.client_mac;
+  return { ...m, hasBaseGrant, hasContinue, hasClientMac };
+}
+
+// -------------------- Rate limit + lock (Redis/mem) --------------------
+async function rlKey(kind, v) {
+  return `rl:${kind}:${v}`;
+}
+async function lockKey(mac) {
+  return `lock:mac:${mac}`;
+}
+
+async function isLocked(mac) {
+  if (!mac) return false;
+  const v = await kvGet(await lockKey(mac));
+  return !!v;
+}
+
+async function bumpRate(kind, v, windowSec) {
+  const key = await rlKey(kind, v);
+  const cur = await kvGet(key);
+  if (!cur) {
+    await kvSet(key, { n: 1 }, windowSec);
+    return 1;
   }
-  return n;
+  cur.n = (cur.n || 0) + 1;
+  await kvSet(key, cur, windowSec);
+  return cur.n;
 }
 
-// =========================
-// UI (minimal, hızlı)
-// =========================
-function pageHtml(title, body) {
+// -------------------- OTP store --------------------
+async function otpKey(marker) {
+  return `otp:${marker}`;
+}
+
+async function createOtp({ phone10, client_mac }) {
+  const marker = randDigits(6);
+  const otp = randDigits(6);
+  const payload = {
+    marker,
+    otp,
+    phone_last4: safeLast4(phone10),
+    phone10: phone10 || "",
+    client_mac: client_mac || "",
+    wrong: 0,
+    created_at: nowISO(),
+  };
+  await kvSet(await otpKey(marker), payload, OTP_TTL_SECONDS);
+  return payload;
+}
+
+async function getOtp(marker) {
+  if (!marker) return null;
+  return await kvGet(await otpKey(marker));
+}
+
+async function delOtp(marker) {
+  if (!marker) return;
+  await kvDel(await otpKey(marker));
+}
+
+// -------------------- UI (HTML) --------------------
+function pageShell({ title, bodyHtml, subtitle }) {
+  const logo = BRAND_LOGO_URL ? `<img src="${escapeHtml(BRAND_LOGO_URL)}" alt="logo" onerror="this.style.display='none'">` : "";
+  const safeTitle = escapeHtml(title || BRAND_NAME);
+  const safeSub = escapeHtml(subtitle || "");
   return `<!doctype html>
 <html lang="tr">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>${title}</title>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:#0b1220; color:#e7eefc; margin:0}
-  .wrap{max-width:560px;margin:0 auto;padding:22px}
-  .card{background:#121a2b;border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.35)}
-  h1{font-size:18px;margin:0 0 10px 0}
-  .muted{opacity:.75;font-size:12px}
-  label{display:block;font-size:12px;opacity:.9;margin:12px 0 6px}
-  input{width:100%;padding:12px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:#0b1220;color:#e7eefc;outline:none}
-  input:focus{border-color:rgba(120,170,255,.55)}
-  button{width:100%;margin-top:14px;padding:12px 14px;border:0;border-radius:12px;background:#3b82f6;color:white;font-weight:700;cursor:pointer}
-  button:hover{filter:brightness(1.05)}
-  .row{display:flex;gap:12px}
-  .row>div{flex:1}
-  .ok{padding:12px;border-radius:12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35)}
-  .warn{padding:12px;border-radius:12px;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.35)}
-  .err{padding:12px;border-radius:12px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35)}
-  a{color:#93c5fd}
-  code{background:rgba(255,255,255,.06); padding:2px 6px; border-radius:8px}
-  table{width:100%;border-collapse:collapse;margin-top:10px}
-  th,td{border-bottom:1px solid rgba(255,255,255,.08);padding:8px 6px;text-align:left;font-size:12px}
-  th{opacity:.8}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${safeTitle}</title>
+  <style>
+    :root{
+      --bg0:#070B14; --bg1:#0B1224; --card:#0F1A33; --card2:#0C152B;
+      --text:#EAF0FF; --muted:#A8B3D6; --line:rgba(255,255,255,.08);
+      --accent:#5B7CFF; --accent2:#00B3FF; --ok:#25D695; --bad:#FF5C7A;
+      --shadow: 0 12px 40px rgba(0,0,0,.45); --radius: 18px;
+      --font: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:var(--font); color:var(--text);
+      background: radial-gradient(1200px 600px at 20% 10%, rgba(91,124,255,.25), transparent 60%),
+                  radial-gradient(900px 500px at 80% 20%, rgba(0,179,255,.18), transparent 55%),
+                  linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height:100vh;
+    }
+    .wrap{max-width:980px; margin:0 auto; padding:28px 18px 60px;}
+    .topbar{
+      display:flex; align-items:center; justify-content:space-between; gap:16px;
+      padding:14px 16px; border:1px solid var(--line);
+      background:rgba(15,26,51,.6); backdrop-filter: blur(8px);
+      border-radius: var(--radius); box-shadow: var(--shadow);
+    }
+    .brand{display:flex; align-items:center; gap:12px;}
+    .logo{
+      width:44px; height:44px; border-radius:12px;
+      background:rgba(255,255,255,.06); display:grid; place-items:center; overflow:hidden;
+      border:1px solid var(--line);
+    }
+    .logo img{width:100%; height:100%; object-fit:contain; padding:8px;}
+    .brand h1{font-size:16px; margin:0; letter-spacing:.2px;}
+    .brand p{margin:2px 0 0; font-size:12px; color:var(--muted);}
+    .card{
+      margin-top:18px; border:1px solid var(--line);
+      background:rgba(15,26,51,.55); border-radius: var(--radius);
+      box-shadow: var(--shadow); overflow:hidden;
+    }
+    .card-h{padding:16px 16px 10px; display:flex; align-items:center; justify-content:space-between; gap:10px;}
+    .card-h .title{font-size:15px; margin:0;}
+    .grid{display:grid; grid-template-columns: 1.2fr .8fr; gap:14px; padding:0 16px 16px;}
+    @media (max-width:860px){ .grid{grid-template-columns:1fr;} }
+    .panel{ border:1px solid var(--line); border-radius:16px; background:rgba(12,21,43,.55); padding:14px; }
+    label{display:block; font-size:12px; color:var(--muted); margin:0 0 8px;}
+    input{
+      width:100%; padding:12px 12px; border-radius:12px;
+      border:1px solid var(--line); background:rgba(0,0,0,.20);
+      color:var(--text); outline:none;
+    }
+    input:focus{border-color: rgba(0,179,255,.5); box-shadow: 0 0 0 4px rgba(0,179,255,.12);}
+    .hint{font-size:12px; color:var(--muted); margin-top:10px; line-height:1.45;}
+    .btn{
+      appearance:none; border:1px solid rgba(91,124,255,.45);
+      background: linear-gradient(180deg, rgba(91,124,255,.95), rgba(91,124,255,.75));
+      color:white; padding:10px 12px; border-radius:12px; cursor:pointer;
+      font-weight:700; font-size:13px; width:100%;
+    }
+    .btn:active{transform: translateY(1px);}
+    .btn.ghost{background:rgba(0,0,0,.12); color:var(--text); border:1px solid var(--line);}
+    .row{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+    @media (max-width:520px){ .row{grid-template-columns:1fr;} }
+    .pill{
+      display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--muted);
+      border:1px solid var(--line); padding:8px 10px; border-radius:999px; background:rgba(0,0,0,.12);
+    }
+    table{width:100%; border-collapse: collapse;}
+    th,td{padding:12px 12px; border-top:1px solid var(--line); font-size:13px; vertical-align:top;}
+    th{color:var(--muted); font-weight:700; text-align:left; background:rgba(0,0,0,.10);}
+    tr:hover td{background:rgba(255,255,255,.03);}
+    .ok{color:var(--ok); font-weight:800;}
+    .bad{color:var(--bad); font-weight:800;}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+    a{color:#bcd0ff}
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="card">
-    ${body}
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo">${logo}</div>
+        <div>
+          <h1>${escapeHtml(BRAND_NAME)}</h1>
+          <p>${safeSub}</p>
+        </div>
+      </div>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <span class="pill"><span class="mono">TZ</span>&nbsp;${escapeHtml(process.env.TZ || "Europe/Istanbul")}</span>
+      </div>
+    </div>
+    ${bodyHtml || ""}
   </div>
-  <div class="muted" style="margin-top:10px">TZ: ${TZ} • KVKK: ${KVKK_VERSION}</div>
-</div>
 </body>
 </html>`;
 }
 
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+// -------------------- Splash pages --------------------
 function kvkkPlaceholderHtml() {
-  return `<div class="muted" style="margin-top:8px">
-    <strong>KVKK Aydınlatma Metni (placeholder)</strong><br/>
-    Bu alan daha sonra gerçek KVKK metni ile değiştirilecektir.
+  return `
+  <div class="hint">
+    <b>KVKK Aydınlatma Metni (Placeholder)</b><br>
+    Bu metin örnek amaçlıdır. Kurumunuzun KVKK aydınlatma metni ile değiştirilecektir.
   </div>`;
 }
 
-// =========================
-// Meraki param parse
-// =========================
-function getMerakiCtx(req) {
-  const q = req.query || {};
-  // Meraki standart paramları:
-  // base_grant_url, continue_url, user_continue_url, client_mac, client_ip, gateway_id, node_id, node_mac, ssid_name
-  const base_grant_url = safeStr(q.base_grant_url || q.baseGrantUrl || "");
-  const continue_url = safeStr(q.continue_url || q.user_continue_url || q.userContinueUrl || "");
-  const client_mac = safeStr(q.client_mac || q.clientMac || "");
-  const client_ip = safeStr(q.client_ip || q.clientIp || "");
-  const gateway_id = safeStr(q.gateway_id || "");
-  const node_id = safeStr(q.node_id || "");
-  const node_mac = safeStr(q.node_mac || "");
-  const ssid = safeStr(q.ssid_name || q.ssid || "");
-  const ap_name = safeStr(q.ap_name || q.ap || "");
-
-  const user_agent = safeStr(req.headers["user-agent"] || "");
-  const accept_language = safeStr(req.headers["accept-language"] || "");
-
-  return {
-    base_grant_url,
-    continue_url,
-    client_mac,
-    client_ip,
-    gateway_id,
-    node_id,
-    node_mac,
-    ssid,
-    ap_name,
-    user_agent,
-    accept_language,
-  };
-}
-
-// =========================
-// Daily canonical export (5651 bütünlük)
-// =========================
-function canonicalizeDaily(records, dayISO, prevSha) {
-  // records: rows from access_logs ordered
-  // Canonical TEXT: stable, deterministic
-  // Format:
-  // DAY=YYYY-MM-DD
-  // PREV_SHA=...
-  // COUNT=n
-  // then each line:
-  // ts|event|client_mac|client_ip|phone|full_name|ssid|ap_name|base_grant_url|continue_url|grant_url|kvkk_version|ua|lang|tz|marker|meta_sha
-  const lines = [];
-  lines.push(`DAY=${dayISO}`);
-  lines.push(`PREV_SHA=${prevSha || ""}`);
-  lines.push(`COUNT=${records.length}`);
-
-  for (const r of records) {
-    const metaStr = r.meta ? JSON.stringify(r.meta) : "";
-    const metaSha = sha256Hex(metaStr);
-    const line = [
-      new Date(r.created_at).toISOString(),
-      safeStr(r.event),
-      safeStr(r.client_mac),
-      safeStr(r.client_ip),
-      safeStr(r.phone),
-      safeStr(r.full_name),
-      safeStr(r.ssid),
-      safeStr(r.ap_name),
-      safeStr(r.base_grant_url),
-      safeStr(r.continue_url),
-      safeStr(r.grant_url),
-      safeStr(r.kvkk_version),
-      safeStr(r.user_agent),
-      safeStr(r.accept_language),
-      safeStr(r.tz),
-      safeStr(r.marker),
-      metaSha
-    ].join("|");
-    lines.push(line);
-  }
-
-  const payloadText = lines.join("\n");
-  const payloadSha = sha256Hex(payloadText);
-
-  return { payloadText, payloadSha };
-}
-
-async function getPrevDailySha(dayISO) {
-  // prev day
-  const d = new Date(dayISO + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() - 1);
-  const prevISO = d.toISOString().slice(0, 10);
-  const prev = await q(`SELECT payload_sha256 FROM daily_chains WHERE day = $1`, [prevISO]);
-  return prev.rows?.[0]?.payload_sha256 || "";
-}
-
-async function buildDaily(dayISO) {
-  if (!pool) throw new Error("DB not configured");
-
-  const prevSha = await getPrevDailySha(dayISO);
-  const rows = await q(
-    `SELECT created_at, event, client_mac, client_ip, ssid, ap_name, base_grant_url, continue_url, grant_url, marker, phone, full_name, kvkk_version, user_agent, accept_language, tz, meta
-     FROM access_logs
-     WHERE (created_at AT TIME ZONE 'UTC')::date = $1::date
-     ORDER BY created_at ASC, id ASC`,
-    [dayISO]
-  );
-
-  const records = rows.rows || [];
-  const { payloadText, payloadSha } = canonicalizeDaily(records, dayISO, prevSha);
-  const sig = DAILY_HMAC_KEY ? hmacHex(DAILY_HMAC_KEY, payloadText) : null;
-
-  const payloadJson = {
-    day: dayISO,
-    prev_sha256: prevSha || null,
-    record_count: records.length,
-    payload_sha256: payloadSha,
-    hmac_sha256: sig,
-  };
-
-  await q(
-    `INSERT INTO daily_chains(day, record_count, payload_sha256, prev_sha256, hmac_sha256, payload_json, payload_text)
-     VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)
-     ON CONFLICT(day) DO UPDATE SET
-       record_count=EXCLUDED.record_count,
-       payload_sha256=EXCLUDED.payload_sha256,
-       prev_sha256=EXCLUDED.prev_sha256,
-       hmac_sha256=EXCLUDED.hmac_sha256,
-       payload_json=EXCLUDED.payload_json,
-       payload_text=EXCLUDED.payload_text`,
-    [dayISO, records.length, payloadSha, prevSha || null, sig, JSON.stringify(payloadJson), payloadText]
-  );
-
-  return payloadJson;
-}
-
-async function verifyDaily(dayISO) {
-  if (!pool) throw new Error("DB not configured");
-
-  const d = await q(`SELECT day, record_count, payload_sha256, prev_sha256, hmac_sha256, payload_text FROM daily_chains WHERE day=$1`, [dayISO]);
-  if (!d.rows.length) {
-    return { ok: false, reason: "No daily record for that day. Build first." };
-  }
-  const row = d.rows[0];
-
-  const prevSha = await getPrevDailySha(dayISO);
-  const rows = await q(
-    `SELECT created_at, event, client_mac, client_ip, ssid, ap_name, base_grant_url, continue_url, grant_url, marker, phone, full_name, kvkk_version, user_agent, accept_language, tz, meta
-     FROM access_logs
-     WHERE (created_at AT TIME ZONE 'UTC')::date = $1::date
-     ORDER BY created_at ASC, id ASC`,
-    [dayISO]
-  );
-  const records = rows.rows || [];
-  const { payloadText, payloadSha } = canonicalizeDaily(records, dayISO, prevSha);
-
-  const okSha = payloadSha === row.payload_sha256;
-  let okHmac = true;
-  if (DAILY_HMAC_KEY && row.hmac_sha256) {
-    const sig = hmacHex(DAILY_HMAC_KEY, payloadText);
-    okHmac = sig === row.hmac_sha256;
-  }
-
-  return {
-    ok: okSha && okHmac,
-    ok_sha256: okSha,
-    ok_hmac: okHmac,
-    expected_sha256: row.payload_sha256,
-    computed_sha256: payloadSha,
-    expected_prev_sha256: row.prev_sha256 || "",
-    computed_prev_sha256: prevSha || "",
-    record_count_db: row.record_count,
-    record_count_now: records.length,
-  };
-}
-
-// =========================
-// App
-// =========================
-const app = express();
-app.disable("x-powered-by");
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json({ limit: "256kb" }));
-
-// Health
-app.get("/health", (req, res) => res.json({ ok: true, ts: nowIso() }));
-
-// Splash GET
-app.get("/", async (req, res) => {
-  const meraki = getMerakiCtx(req);
-  const mode = safeStr(req.query.mode || OTP_MODE || "screen");
-
-  console.log("SPLASH_OPEN", {
-    hasBaseGrant: Boolean(meraki.base_grant_url),
-    hasContinue: Boolean(meraki.continue_url),
-    hasClientMac: Boolean(meraki.client_mac),
-    mode
-  });
-
-  await dbLog("SPLASH_OPEN", {
-    ...meraki,
-    tz: TZ,
-    meta: {
-      gateway_id: meraki.gateway_id,
-      node_id: meraki.node_id,
-      node_mac: meraki.node_mac,
-      mode
-    }
-  });
+function splashFormHtml(ctx, screenOtp) {
+  const q = reqQueryPreserve(ctx);
+  const subtitle = "Misafir İnternet Erişimi • KVKK Onay • OTP Doğrulama";
+  const otpInfo = screenOtp ? `<div class="pill"><span class="mono">OTP</span>&nbsp;<span class="ok mono">${escapeHtml(screenOtp)}</span></div>` : "";
 
   const body = `
-    <h1>Misafir İnternet Erişimi</h1>
-    <div class="muted">Lütfen bilgilerinizi girin ve KVKK onayını verin.</div>
+  <div class="card">
+    <div class="card-h">
+      <h2 class="title">Bağlantı Doğrulama</h2>
+      ${otpInfo}
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <form method="POST" action="/otp/start${q}">
+          <div class="row">
+            <div>
+              <label>Ad Soyad</label>
+              <input name="full_name" placeholder="Ad Soyad" required maxlength="80">
+            </div>
+            <div>
+              <label>Cep Telefonu</label>
+              <input name="phone" placeholder="5XXXXXXXXX" inputmode="numeric" required maxlength="16">
+            </div>
+          </div>
+          <label style="margin-top:12px;">
+            <input type="checkbox" name="kvkk_ok" value="1" required>
+            KVKK aydınlatma metnini okudum, onaylıyorum.
+          </label>
+          ${kvkkPlaceholderHtml()}
+          <div style="margin-top:12px;">
+            <button class="btn" type="submit">OTP Oluştur</button>
+          </div>
+          <div class="hint">
+            <b>Not:</b> Şimdilik OTP <b>ekranda</b> gösteriliyor (OTP_MODE=screen).
+          </div>
+        </form>
+      </div>
 
-    ${kvkkPlaceholderHtml()}
+      <div class="panel">
+        <form method="POST" action="/otp/verify${q}">
+          <label>Marker</label>
+          <input name="marker" placeholder="6 haneli marker" inputmode="numeric" required maxlength="6">
+          <label style="margin-top:10px;">OTP</label>
+          <input name="otp" placeholder="6 haneli OTP" inputmode="numeric" required maxlength="6">
+          <div style="margin-top:12px;">
+            <button class="btn" type="submit">Doğrula & Bağlan</button>
+          </div>
+          <div class="hint">
+            Bu adım sonunda Meraki Grant’e yönlendirilirsiniz.
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
 
-    <form method="POST" action="/otp/start">
-      <label>Ad Soyad</label>
-      <input name="full_name" autocomplete="name" required placeholder="Ad Soyad"/>
-
-      <label>Cep Telefonu (5XXXXXXXXX)</label>
-      <input name="phone" inputmode="numeric" autocomplete="tel" required placeholder="5XXXXXXXXX"/>
-
-      <label style="display:flex;gap:8px;align-items:flex-start;margin-top:14px">
-        <input type="checkbox" name="kvkk_ok" value="1" required style="width:18px;height:18px;margin-top:2px"/>
-        <span style="font-size:12px;opacity:.9">KVKK metnini okudum, anladım ve onaylıyorum.</span>
-      </label>
-
-      <input type="hidden" name="base_grant_url" value="${encodeURIComponent(meraki.base_grant_url)}"/>
-      <input type="hidden" name="continue_url" value="${encodeURIComponent(meraki.continue_url)}"/>
-      <input type="hidden" name="client_mac" value="${encodeURIComponent(meraki.client_mac)}"/>
-      <input type="hidden" name="client_ip" value="${encodeURIComponent(meraki.client_ip)}"/>
-      <input type="hidden" name="ssid" value="${encodeURIComponent(meraki.ssid)}"/>
-      <input type="hidden" name="ap_name" value="${encodeURIComponent(meraki.ap_name)}"/>
-      <input type="hidden" name="gateway_id" value="${encodeURIComponent(meraki.gateway_id)}"/>
-      <input type="hidden" name="node_id" value="${encodeURIComponent(meraki.node_id)}"/>
-      <input type="hidden" name="node_mac" value="${encodeURIComponent(meraki.node_mac)}"/>
-      <input type="hidden" name="mode" value="${encodeURIComponent(mode)}"/>
-
-      <button type="submit">Devam Et</button>
-    </form>
+  <div class="card">
+    <div class="card-h">
+      <h2 class="title">Teknik (Meraki)</h2>
+      <span class="pill">${ctx.hasBaseGrant ? `<span class="ok">base_grant_url OK</span>` : `<span class="bad">base_grant_url yok</span>`}</span>
+    </div>
+    <div style="padding:0 16px 16px;">
+      <div class="hint mono">
+        client_mac=${escapeHtml(ctx.client_mac || "")}<br>
+        client_ip=${escapeHtml(ctx.client_ip || "")}<br>
+        continue_url=${escapeHtml(ctx.continue_url || "")}
+      </div>
+    </div>
+  </div>
   `;
+  return pageShell({ title: BRAND_NAME, subtitle, bodyHtml: body });
+}
 
-  res.status(200).send(pageHtml("Guest WiFi", body));
+function reqQueryPreserve(ctx) {
+  // Meraki query paramlarını sayfalar arası taşı
+  const p = new URLSearchParams();
+  for (const k of ["base_grant_url", "continue_url", "client_ip", "client_mac", "node_mac", "gateway_id", "node_id"]) {
+    if (ctx[k]) p.set(k, ctx[k]);
+  }
+  const qs = p.toString();
+  return qs ? `?${qs}` : "";
+}
+
+// -------------------- Routes --------------------
+app.get("/", async (req, res) => {
+  const ctx = splashContext(req);
+  console.log("SPLASH_OPEN", { hasBaseGrant: ctx.hasBaseGrant, hasContinue: !!ctx.continue_url, hasClientMac: !!ctx.client_mac, mode: OTP_MODE });
+
+  await dbLog("SPLASH_OPEN", {
+    client_mac: ctx.client_mac || null,
+    client_ip: ctx.client_ip || null,
+    base_grant_url: ctx.base_grant_url || null,
+    continue_url: ctx.continue_url || null,
+    kvkk_version: KVKK_VERSION,
+    accept_language: (req.headers["accept-language"] || "").toString(),
+    user_agent: (req.headers["user-agent"] || "").toString(),
+    tz: process.env.TZ || "Europe/Istanbul",
+    meta: { gateway_id: ctx.gateway_id || null, node_id: ctx.node_id || null, node_mac: ctx.node_mac || null },
+  });
+
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).send(splashFormHtml(ctx, null));
 });
 
-// OTP Start
 app.post("/otp/start", async (req, res) => {
-  const full_name = safeStr(req.body.full_name).trim();
-  const phone = sanitizePhoneTR(req.body.phone);
-  const kvkk_ok = safeStr(req.body.kvkk_ok) === "1";
+  const ctx = splashContext(req);
+  const full_name = String(req.body.full_name || "").trim();
+  const phone10 = cleanPhoneTR10(req.body.phone || "");
+  const kvkk_ok = String(req.body.kvkk_ok || "") === "1";
 
-  const meraki = {
-    base_grant_url: decodeURIComponent(safeStr(req.body.base_grant_url || "")),
-    continue_url: decodeURIComponent(safeStr(req.body.continue_url || "")),
-    client_mac: decodeURIComponent(safeStr(req.body.client_mac || "")),
-    client_ip: decodeURIComponent(safeStr(req.body.client_ip || "")),
-    ssid: decodeURIComponent(safeStr(req.body.ssid || "")),
-    ap_name: decodeURIComponent(safeStr(req.body.ap_name || "")),
-    gateway_id: decodeURIComponent(safeStr(req.body.gateway_id || "")),
-    node_id: decodeURIComponent(safeStr(req.body.node_id || "")),
-    node_mac: decodeURIComponent(safeStr(req.body.node_mac || "")),
-  };
+  const client_mac = ctx.client_mac || "";
+  const client_ip = ctx.client_ip || getClientIp(req);
 
-  const mode = safeStr(req.body.mode || OTP_MODE || "screen").toLowerCase();
+  if (!kvkk_ok) return res.status(400).send("KVKK onayı gerekli.");
+  if (!full_name || full_name.length < 3) return res.status(400).send("Ad soyad gerekli.");
+  if (!phone10) return res.status(400).send("Telefon formatı hatalı. 5XXXXXXXXX (10 hane) olmalı.");
 
-  if (!full_name || !phone || !kvkk_ok) {
-    await dbLog("OTP_START_REJECTED", {
-      ...meraki,
-      phone,
-      full_name,
-      meta: { reason: "missing_fields_or_invalid_phone", kvkk_ok, mode }
-    });
-    return res.status(400).send(pageHtml("Hata", `<div class="err">Bilgiler eksik veya telefon formatı hatalı. Telefon <code>5XXXXXXXXX</code> olmalı.</div>`));
+  if (client_mac) {
+    if (await isLocked(client_mac)) return res.status(429).send("Cihaz geçici olarak kilitli.");
+    await bumpRate("mac", client_mac, RL_MAC_SECONDS);
   }
+  await bumpRate("phone", phone10, RL_PHONE_SECONDS);
 
-  // lock/rate
-  if (await isLocked(meraki.client_mac, phone)) {
-    await dbLog("OTP_LOCKED", { ...meraki, phone, full_name, meta: { mode } });
-    return res.status(429).send(pageHtml("Kilit", `<div class="err">Çok fazla deneme yapıldı. Lütfen daha sonra tekrar deneyin.</div>`));
-  }
-
-  if (redis) {
-    const macCount = meraki.client_mac ? await rIncrWithTTL(rlMacKey(meraki.client_mac), RL_MAC_SECONDS) : 0;
-    const phCount = await rIncrWithTTL(rlPhoneKey(phone), RL_PHONE_SECONDS);
-
-    if ((meraki.client_mac && macCount > 3) || phCount > 3) {
-      await dbLog("OTP_RATE_LIMIT", { ...meraki, phone, full_name, meta: { macCount, phCount, mode } });
-      return res.status(429).send(pageHtml("Yavaş", `<div class="warn">Çok hızlı deneme yapıyorsun. Lütfen ${RL_PHONE_SECONDS} sn sonra tekrar dene.</div>`));
-    }
-  }
-
-  const marker = randMarker();
-  const otp = randOtp();
-
-  const store = {
-    marker,
-    otp,
-    created_at: nowIso(),
-    phone,
-    full_name,
-    kvkk_version: KVKK_VERSION,
-    tz: TZ,
-    meraki,
-    ua: safeStr(req.headers["user-agent"] || ""),
-    lang: safeStr(req.headers["accept-language"] || "")
-  };
-
-  await rSet(otpKey(marker), JSON.stringify(store), OTP_TTL_SECONDS);
-
-  console.log("OTP_CREATED", { marker, last4: maskLast4(phone), client_mac: meraki.client_mac });
+  const otpObj = await createOtp({ phone10, client_mac });
+  console.log("OTP_CREATED", { marker: otpObj.marker, last4: safeLast4(phone10), client_mac: client_mac || null });
 
   await dbLog("OTP_CREATED", {
-    ...meraki,
-    marker,
-    phone,
+    marker: otpObj.marker,
+    phone: phone10,
     full_name,
-    user_agent: store.ua,
-    accept_language: store.lang,
-    tz: TZ,
-    meta: { mode }
+    client_mac: client_mac || null,
+    client_ip: client_ip || null,
+    base_grant_url: ctx.base_grant_url || null,
+    continue_url: ctx.continue_url || null,
+    kvkk_version: KVKK_VERSION,
+    accept_language: (req.headers["accept-language"] || "").toString(),
+    user_agent: (req.headers["user-agent"] || "").toString(),
+    tz: process.env.TZ || "Europe/Istanbul",
+    meta: { otp_mode: OTP_MODE },
   });
 
-  // screen mode: OTP'yi ekranda göster
-  if (mode === "screen") {
-    console.log("OTP_SCREEN_CODE", { marker, otp });
-
-    await dbLog("OTP_SCREEN_SHOWN", {
-      ...meraki,
-      marker,
-      phone,
-      full_name,
-      meta: { mode }
-    });
-
-    const body = `
-      <h1>Doğrulama Kodu</h1>
-      <div class="ok">Kodunuz: <code style="font-size:18px">${otp}</code></div>
-      <div class="muted" style="margin-top:10px">Kod ${OTP_TTL_SECONDS} saniye geçerlidir.</div>
-
-      <form method="POST" action="/otp/verify">
-        <label>OTP Kodu</label>
-        <input name="otp" inputmode="numeric" required placeholder="6 haneli kod"/>
-        <input type="hidden" name="marker" value="${marker}"/>
-        <button type="submit">Bağlan</button>
-      </form>
-    `;
-    return res.status(200).send(pageHtml("OTP", body));
+  // OTP_MODE=screen => ekranda göster
+  if (OTP_MODE === "screen") {
+    console.log("OTP_SCREEN_CODE", { marker: otpObj.marker, otp: otpObj.otp });
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(splashFormHtml(ctx, otpObj.otp));
   }
 
-  // sms mode (şimdilik kapalı/placeholder)
-  await dbLog("OTP_SMS_SKIPPED", {
-    ...meraki,
-    marker,
-    phone,
-    full_name,
-    meta: { reason: "OTP_MODE=sms not implemented yet" }
-  });
-  return res.status(501).send(pageHtml("SMS", `<div class="warn">SMS modu henüz devrede değil. <code>OTP_MODE=screen</code> kullan.</div>`));
+  // sms modunu sonra açacağız
+  res.status(501).send("OTP_MODE=sms henüz aktif değil.");
 });
 
-// OTP Verify
 app.post("/otp/verify", async (req, res) => {
-  const marker = safeStr(req.body.marker).trim();
-  const otpIn = safeStr(req.body.otp).replace(/\D/g, "");
+  const ctx = splashContext(req);
+  const marker = String(req.body.marker || "").replace(/\D/g, "").slice(0, 6);
+  const otp = String(req.body.otp || "").replace(/\D/g, "").slice(0, 6);
 
-  const raw = await rGet(otpKey(marker));
-  if (!raw) {
-    await dbLog("OTP_VERIFY_FAIL", { marker, meta: { reason: "expired_or_missing" } });
-    return res.status(400).send(pageHtml("Hata", `<div class="err">Kod süresi dolmuş olabilir. Lütfen tekrar deneyin.</div><a href="/">Başa dön</a>`));
+  const client_mac = ctx.client_mac || "";
+  const client_ip = ctx.client_ip || getClientIp(req);
+
+  const obj = await getOtp(marker);
+  if (!obj) {
+    await dbLog("OTP_VERIFY_FAIL", { marker, client_mac, client_ip, meta: { reason: "NOT_FOUND" } });
+    return res.status(400).send("Marker bulunamadı / süresi doldu.");
   }
 
-  let st = null;
-  try { st = JSON.parse(raw); } catch { st = null; }
-  if (!st || !st.otp) {
-    await dbLog("OTP_VERIFY_FAIL", { marker, meta: { reason: "store_corrupt" } });
-    return res.status(400).send(pageHtml("Hata", `<div class="err">Doğrulama verisi bozuk. Lütfen tekrar deneyin.</div><a href="/">Başa dön</a>`));
+  // client_mac gelmezse de doğrulama yapalım, ama grant için base_grant_url şart.
+  if (await isLocked(obj.client_mac || client_mac)) {
+    await dbLog("OTP_VERIFY_FAIL", { marker, client_mac, client_ip, meta: { reason: "LOCKED" } });
+    return res.status(429).send("Cihaz geçici olarak kilitli.");
   }
 
-  const meraki = st.meraki || {};
-  const phone = st.phone || "";
-  const full_name = st.full_name || "";
-
-  if (await isLocked(meraki.client_mac, phone)) {
-    await dbLog("OTP_LOCKED", { ...meraki, marker, phone, full_name });
-    return res.status(429).send(pageHtml("Kilit", `<div class="err">Çok fazla deneme yapıldı. Lütfen daha sonra tekrar deneyin.</div>`));
-  }
-
-  if (otpIn !== st.otp) {
-    const wrong = await bumpWrong(marker, meraki.client_mac, phone);
+  if (obj.otp !== otp) {
+    obj.wrong = (obj.wrong || 0) + 1;
+    await kvSet(await otpKey(marker), obj, OTP_TTL_SECONDS);
 
     await dbLog("OTP_VERIFY_FAIL", {
-      ...meraki,
       marker,
-      phone,
-      full_name,
-      meta: { reason: "wrong_otp", wrong_attempts: wrong }
+      client_mac,
+      client_ip,
+      phone: obj.phone10 || null,
+      meta: { reason: "WRONG_OTP", wrong: obj.wrong },
     });
 
-    return res.status(401).send(pageHtml("Hata", `<div class="err">Kod yanlış. Tekrar deneyin.</div>`));
+    if (obj.wrong >= MAX_WRONG_ATTEMPTS) {
+      const m = obj.client_mac || client_mac;
+      if (m) await kvSet(await lockKey(m), { locked: true }, LOCK_SECONDS);
+      return res.status(429).send("Çok fazla deneme. Cihaz kilitlendi.");
+    }
+    return res.status(400).send("OTP hatalı.");
   }
-
-  // OK
-  await rDel(otpKey(marker));
-
-  console.log("OTP_VERIFY_OK", { marker, client_mac: meraki.client_mac });
 
   await dbLog("OTP_VERIFY_OK", {
-    ...meraki,
     marker,
-    phone,
-    full_name,
-    user_agent: st.ua || "",
-    accept_language: st.lang || "",
-    tz: TZ,
-    meta: {}
+    client_mac,
+    client_ip,
+    phone: obj.phone10 || null,
+    meta: { otp_mode: OTP_MODE },
   });
 
-  // Grant redirect: Meraki’ye “izin ver”
-  // base_grant_url yoksa grant yapamayız -> kullanıcı OK görür ama internet açılmaz
-  if (!meraki.base_grant_url) {
-    await dbLog("GRANT_MISSING_BASE_URL", { ...meraki, marker, phone, full_name, meta: { reason: "base_grant_url_missing" } });
-    return res.status(200).send(pageHtml("OK", `
-      <h1>OK</h1>
-      <div class="warn">Doğrulama başarılı fakat Meraki parametreleri eksik: <code>base_grant_url</code> yok. (Genelde PC’nin captive portal’ı doğru açmamasından olur.)</div>
-    `));
+  console.log("OTP_VERIFY_OK", { marker, client_mac: client_mac || obj.client_mac || "" });
+
+  // Meraki grant için base_grant_url şart
+  if (!ctx.base_grant_url) {
+    // Kullanıcı internete çıkamaz; sayfaya geri dönsün
+    console.log("WARN: base_grant_url missing after OTP verify");
+    return res.status(200).send(pageShell({
+      title: BRAND_NAME,
+      subtitle: "Hata",
+      bodyHtml: `<div class="card"><div class="card-h"><h2 class="title">Meraki Bilgisi Eksik</h2></div>
+      <div style="padding:0 16px 16px;">
+        <div class="hint">OTP doğrulandı ancak <b>base_grant_url</b> gelmedi. Bu genelde splash sayfasının Meraki tarafından doğru çağrılmaması veya test URL’si ile açılması durumunda olur.</div>
+        <div class="hint"><a href="/">Splash sayfasına Meraki üzerinden tekrar yönlen.</a></div>
+      </div></div>`
+    }));
   }
 
-  // continue_url yoksa default ver (Android/Windows connectivity check vs.)
-  const cont = meraki.continue_url || "http://connectivitycheck.gstatic.com/generate_204";
-
-  // Meraki grant linki
-  // Not: bazı ortamlarda base_grant_url zaten query taşır; biz append güvenli yapalım
-  const u = new URL(meraki.base_grant_url);
-  u.searchParams.set("continue_url", cont);
-  // duration: 3600 (1 saat) istersen env’den yapılır
-  u.searchParams.set("duration", "3600");
-
-  const grantUrl = u.toString();
+  // redirect to Meraki grant
+  const grantUrl = buildMerakiGrantUrl(ctx, 3600);
   console.log("GRANT_CLIENT_REDIRECT:", grantUrl);
 
-  await dbLog("GRANT_CLIENT_REDIRECT", {
-    ...meraki,
-    grant_url: grantUrl,
+  await dbLog("GRANT_REDIRECT", {
     marker,
-    phone,
-    full_name,
-    user_agent: st.ua || "",
-    accept_language: st.lang || "",
-    tz: TZ,
+    client_mac,
+    client_ip,
+    base_grant_url: ctx.base_grant_url,
+    continue_url: ctx.continue_url || null,
+    phone: obj.phone10 || null,
     meta: { duration: 3600 }
   });
 
+  // marker bir kez kullanılsın
+  await delOtp(marker);
+
+  res.setHeader("Cache-Control", "no-store");
   return res.redirect(302, grantUrl);
 });
 
-// =========================
-// ADMIN UI (5651)
-// =========================
-app.get("/admin", basicAuthMiddleware, async (req, res) => {
-  const body = `
-    <h1>Admin</h1>
-    <div class="muted">5651 log ve günlük imza/zincir</div>
-    <ul>
-      <li><a href="/admin/5651">5651 Log Ekranı</a></li>
-      <li><a href="/admin/daily">Günlük İmza/Zincir</a></li>
-    </ul>
-  `;
-  res.send(pageHtml("Admin", body));
-});
+function buildMerakiGrantUrl(ctx, durationSec) {
+  // Meraki gereksinimi: base_grant_url + duration + continue_url (varsa)
+  // base_grant_url zaten ".../grant" şeklinde gelir. Üzerine query ekle.
+  const u = new URL(ctx.base_grant_url);
+  u.searchParams.set("duration", String(durationSec || 3600));
 
-app.get("/admin/5651", basicAuthMiddleware, async (req, res) => {
-  const hours = Number(req.query.hours || 24);
-  const phone = sanitizePhoneTR(req.query.phone || "");
-  const mac = safeStr(req.query.mac || "").toLowerCase();
-  const ip = safeStr(req.query.ip || "");
-  const event = safeStr(req.query.event || "");
+  // continue_url varsa ekle; yoksa ekleme (bazı ortamlarda yok)
+  if (ctx.continue_url) u.searchParams.set("continue_url", ctx.continue_url);
 
-  let where = `WHERE created_at >= NOW() - ($1::int || ' hours')::interval`;
-  const params = [hours];
+  // bazı meraki ortamlarında bu paramlar ayrıca istenebiliyor; biz varsa geçiriyoruz:
+  for (const k of ["gateway_id", "node_id", "client_ip", "client_mac", "node_mac"]) {
+    if (ctx[k]) u.searchParams.set(k, ctx[k]);
+  }
+  return u.toString();
+}
 
-  if (phone) { params.push(phone); where += ` AND phone = $${params.length}`; }
-  if (mac) { params.push(mac); where += ` AND lower(client_mac) = $${params.length}`; }
-  if (ip) { params.push(ip); where += ` AND client_ip = $${params.length}`; }
-  if (event) { params.push(event); where += ` AND event = $${params.length}`; }
+// -------------------- Admin UI (5651) --------------------
+app.get("/admin/logs", requireAdmin, async (req, res) => {
+  const limit = clampInt(req.query.limit, 200, 50, 2000);
+  const qtxt = String(req.query.q || "").trim();
+  const day = String(req.query.day || "").trim(); // YYYY-MM-DD
+  const phone = String(req.query.phone || "").trim();
+  const mac = String(req.query.mac || "").trim();
 
-  const rows = await q(
-    `SELECT created_at, event, client_mac, client_ip, phone, full_name, ssid, ap_name, marker
+  if (!pool) return res.status(500).send("DATABASE_URL missing");
+
+  const where = [];
+  const params = [];
+  let i = 1;
+
+  if (qtxt) {
+    where.push(`(event ILIKE $${i} OR client_mac ILIKE $${i} OR client_ip ILIKE $${i} OR phone ILIKE $${i} OR full_name ILIKE $${i})`);
+    params.push(`%${qtxt}%`);
+    i++;
+  }
+  if (day) {
+    where.push(`created_at >= $${i}::date AND created_at < ($${i}::date + interval '1 day')`);
+    params.push(day);
+    i++;
+  }
+  if (phone) {
+    where.push(`phone = $${i}`);
+    params.push(cleanPhoneTR10(phone) || phone);
+    i++;
+  }
+  if (mac) {
+    where.push(`lower(client_mac) = lower($${i})`);
+    params.push(mac);
+    i++;
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  params.push(limit);
+
+  const rows = (await q(
+    `SELECT id, created_at, event, client_mac, client_ip, ssid, ap_name, phone, full_name, kvkk_version
      FROM access_logs
-     ${where}
-     ORDER BY created_at DESC
-     LIMIT 200`,
+     ${whereSql}
+     ORDER BY created_at DESC, id DESC
+     LIMIT $${i}`,
     params
-  );
+  )).rows;
 
-  const tr = (rows.rows || []).map(r => `
-    <tr>
-      <td>${new Date(r.created_at).toISOString()}</td>
-      <td>${safeStr(r.event)}</td>
-      <td>${safeStr(r.phone)}</td>
-      <td>${safeStr(r.full_name)}</td>
-      <td>${safeStr(r.client_mac)}</td>
-      <td>${safeStr(r.client_ip)}</td>
-      <td>${safeStr(r.ssid)}</td>
-      <td>${safeStr(r.ap_name)}</td>
-      <td>${safeStr(r.marker)}</td>
-    </tr>
-  `).join("");
+  const today = new Date().toISOString().slice(0, 10);
 
   const body = `
-    <h1>5651 Loglar</h1>
-    <div class="muted">Son kayıtlar (max 200). Filtreleyebilirsin.</div>
-
-    <form method="GET" action="/admin/5651">
-      <div class="row">
-        <div>
-          <label>Son kaç saat?</label>
-          <input name="hours" value="${hours}" placeholder="24"/>
-        </div>
-        <div>
-          <label>Telefon (5XXXXXXXXX)</label>
-          <input name="phone" value="${phone || ""}" placeholder="5XXXXXXXXX"/>
-        </div>
-      </div>
-
-      <div class="row">
-        <div>
-          <label>MAC</label>
-          <input name="mac" value="${mac}" placeholder="aa:bb:cc:dd:ee:ff"/>
-        </div>
-        <div>
-          <label>IP</label>
-          <input name="ip" value="${ip}" placeholder="10.x.x.x"/>
-        </div>
-      </div>
-
-      <label>Event</label>
-      <input name="event" value="${event}" placeholder="GRANT_CLIENT_REDIRECT"/>
-
-      <button type="submit">Filtrele</button>
-    </form>
-
-    <div style="margin-top:14px" class="muted">
-      Export: <a href="/admin/daily/export?day=${new Date().toISOString().slice(0,10)}">Bugün TXT</a> •
-      <a href="/admin/daily/export.json?day=${new Date().toISOString().slice(0,10)}">Bugün JSON</a>
+  <div class="card">
+    <div class="card-h">
+      <h2 class="title">5651 Loglar</h2>
+      <span class="pill"><span class="mono">Kayıt</span>&nbsp;${rows.length}</span>
     </div>
+    <div style="padding:0 16px 16px;">
+      <form method="GET" action="/admin/logs">
+        <div class="row">
+          <div><label>Arama (q)</label><input name="q" value="${escapeHtml(qtxt)}" placeholder="event / mac / ip / telefon / ad"></div>
+          <div><label>Gün (YYYY-MM-DD)</label><input name="day" value="${escapeHtml(day)}" placeholder="${today}"></div>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <div><label>Telefon</label><input name="phone" value="${escapeHtml(phone)}" placeholder="5XXXXXXXXX"></div>
+          <div><label>MAC</label><input name="mac" value="${escapeHtml(mac)}" placeholder="aa:bb:cc:dd:ee:ff"></div>
+        </div>
+        <div style="margin-top:12px;">
+          <button class="btn" type="submit">Filtrele</button>
+        </div>
+        <div class="hint">
+          Daily rapor: <a href="/admin/daily">/admin/daily</a> • Doğrulama: <a href="/admin/daily/verify">/admin/daily/verify</a>
+        </div>
+      </form>
+    </div>
+  </div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Zaman</th><th>Event</th><th>Telefon</th><th>Ad Soyad</th><th>MAC</th><th>IP</th><th>SSID</th><th>AP</th><th>Marker</th>
-        </tr>
-      </thead>
-      <tbody>${tr || `<tr><td colspan="9" class="muted">Kayıt yok</td></tr>`}</tbody>
-    </table>
+  <div class="card">
+    <div class="card-h"><h2 class="title">Kayıtlar</h2></div>
+    <div style="overflow:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Zaman</th><th>Event</th><th>MAC</th><th>IP</th><th>Telefon</th><th>Ad Soyad</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td class="mono">${escapeHtml(new Date(r.created_at).toISOString())}</td>
+              <td><span class="mono">${escapeHtml(r.event)}</span></td>
+              <td class="mono">${escapeHtml(r.client_mac || "")}</td>
+              <td class="mono">${escapeHtml(r.client_ip || "")}</td>
+              <td class="mono">${escapeHtml(r.phone || "")}</td>
+              <td>${escapeHtml(r.full_name || "")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  </div>
   `;
-  res.send(pageHtml("5651", body));
+
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).send(pageShell({ title: "Admin Logs", subtitle: "5651 Uyumlu Kayıtlar • Admin", bodyHtml: body }));
 });
 
-// Daily UI
-app.get("/admin/daily", basicAuthMiddleware, async (req, res) => {
-  const day = safeStr(req.query.day || new Date().toISOString().slice(0, 10));
+app.get("/admin/daily", requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).send("DATABASE_URL missing");
 
-  const existing = await q(`SELECT day, record_count, payload_sha256, prev_sha256, hmac_sha256, created_at FROM daily_chains WHERE day=$1`, [day]);
-  const row = existing.rows[0];
+  const rows = (await q(
+    `SELECT day, created_at, tz, count_total, count_verify_ok, count_grant_ok, hash_prev, hash_curr, hmac_sig
+     FROM daily_summaries
+     ORDER BY day DESC
+     LIMIT 60`
+  )).rows;
 
   const body = `
-    <h1>Günlük İmza/Zincir</h1>
-    <div class="muted">5651 için günlük paket hash + (opsiyonel) HMAC imza</div>
-
-    <form method="GET" action="/admin/daily">
-      <label>Gün (YYYY-MM-DD)</label>
-      <input name="day" value="${day}" />
-      <button type="submit">Göster</button>
-    </form>
-
-    <div class="row" style="margin-top:10px">
-      <div><a href="/admin/daily/build?day=${day}">Build</a></div>
-      <div><a href="/admin/daily/verify?day=${day}">Verify</a></div>
-      <div><a href="/admin/daily/export?day=${day}">Export TXT</a></div>
-      <div><a href="/admin/daily/export.json?day=${day}">Export JSON</a></div>
+  <div class="card">
+    <div class="card-h">
+      <h2 class="title">Daily 5651 Özet (Hash Chain)</h2>
+      <span class="pill">${DAILY_HMAC_SECRET ? `<span class="ok">HMAC aktif</span>` : `<span class="bad">DAILY_HMAC_SECRET yok</span>`}</span>
     </div>
-
-    <div style="margin-top:12px">
-      ${row ? `
-        <div class="ok">
-          <div><strong>Day:</strong> ${row.day}</div>
-          <div><strong>Records:</strong> ${row.record_count}</div>
-          <div><strong>SHA256:</strong> <code>${row.payload_sha256}</code></div>
-          <div><strong>Prev:</strong> <code>${row.prev_sha256 || ""}</code></div>
-          <div><strong>HMAC:</strong> <code>${row.hmac_sha256 || ""}</code></div>
-          <div class="muted">Created: ${new Date(row.created_at).toISOString()}</div>
-        </div>
-      ` : `<div class="warn">Bu gün için günlük paket yok. Build yap.</div>`}
+    <div style="padding:0 16px 16px;">
+      <div class="hint">
+        Bu sayfa her günün özet hash’ini ve bir önceki güne bağlı hash-chain’i gösterir.
+        <br>Doğrulama: <a href="/admin/daily/verify">/admin/daily/verify</a>
+      </div>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2 class="title">Son 60 Gün</h2></div>
+    <div style="overflow:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Gün</th><th>Toplam</th><th>Verify OK</th><th>Grant OK</th><th>hash_prev</th><th>hash_curr</th><th>hmac</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td class="mono">${escapeHtml(String(r.day))}</td>
+              <td class="mono">${escapeHtml(String(r.count_total))}</td>
+              <td class="mono">${escapeHtml(String(r.count_verify_ok))}</td>
+              <td class="mono">${escapeHtml(String(r.count_grant_ok))}</td>
+              <td class="mono">${escapeHtml((r.hash_prev || "").slice(0, 16))}…</td>
+              <td class="mono">${escapeHtml((r.hash_curr || "").slice(0, 16))}…</td>
+              <td class="mono">${escapeHtml((r.hmac_sig || "").slice(0, 16))}…</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  </div>
   `;
-  res.send(pageHtml("Daily", body));
+
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).send(pageShell({ title: "Daily", subtitle: "5651 Günlük Özet & İmza • Admin", bodyHtml: body }));
 });
 
-app.get("/admin/daily/build", basicAuthMiddleware, async (req, res) => {
-  const day = safeStr(req.query.day || new Date().toISOString().slice(0, 10));
+app.get("/admin/daily/verify", requireAdmin, async (req, res) => {
+  if (!pool) return res.status(500).send("DATABASE_URL missing");
+  if (!DAILY_HMAC_SECRET) return res.status(500).send("DAILY_HMAC_SECRET missing");
+
+  const rows = (await q(
+    `SELECT day, tz, count_total, count_verify_ok, count_grant_ok, hash_prev, hash_curr, hmac_sig
+     FROM daily_summaries
+     ORDER BY day ASC`
+  )).rows;
+
+  let ok = true;
+  let prev = "";
+  const checks = [];
+
+  for (const r of rows) {
+    const material = `${r.day}|${r.tz}|${r.count_total}|${r.count_verify_ok}|${r.count_grant_ok}|${r.hash_prev || ""}|${prev}`;
+    // açıklama: hash_prev alanı DB’de durur, ayrıca zincir kontrolünde "prev" ile de kıyaslıyoruz
+    const expectedHash = sha256Hex(material);
+    const expectedHmac = hmacHex(DAILY_HMAC_SECRET, expectedHash);
+
+    const chainOk = (r.hash_prev || "") === prev;
+    const hashOk = (r.hash_curr || "") === expectedHash;
+    const hmacOk = (r.hmac_sig || "") === expectedHmac;
+
+    const rowOk = chainOk && hashOk && hmacOk;
+    if (!rowOk) ok = false;
+
+    checks.push({
+      day: String(r.day),
+      chainOk, hashOk, hmacOk,
+      expectedPrev: prev,
+      gotPrev: r.hash_prev || "",
+    });
+
+    prev = r.hash_curr || "";
+  }
+
+  const body = `
+  <div class="card">
+    <div class="card-h">
+      <h2 class="title">Daily Doğrulama</h2>
+      <span class="pill">${ok ? `<span class="ok">OK</span>` : `<span class="bad">FAIL</span>`}</span>
+    </div>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Gün</th><th>Chain</th><th>Hash</th><th>HMAC</th></tr></thead>
+        <tbody>
+          ${checks.slice(-60).reverse().map(c => `
+            <tr>
+              <td class="mono">${escapeHtml(c.day)}</td>
+              <td>${c.chainOk ? `<span class="ok">OK</span>` : `<span class="bad">FAIL</span>`}</td>
+              <td>${c.hashOk ? `<span class="ok">OK</span>` : `<span class="bad">FAIL</span>`}</td>
+              <td>${c.hmacOk ? `<span class="ok">OK</span>` : `<span class="bad">FAIL</span>`}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  `;
+
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).send(pageShell({ title: "Daily Verify", subtitle: "Hash Chain & HMAC Doğrulama • Admin", bodyHtml: body }));
+});
+
+// -------------------- Daily builder (startup) --------------------
+// Her start'ta: "bugün" için günlük özet üret.
+// Çok sık üretmesin diye: aynı gün varsa overwrite eder (idempotent).
+async function buildTodayDaily() {
+  if (!pool) return;
+  if (!DAILY_HMAC_SECRET) {
+    console.log("DAILY: DAILY_HMAC_SECRET not set. Skipping daily build.");
+    return;
+  }
+
+  const tz = process.env.TZ || "Europe/Istanbul";
+  const day = new Date().toISOString().slice(0, 10);
+
   try {
-    const out = await buildDaily(day);
-    res.json({ ok: true, ...out });
+    // counts
+    const total = (await q(
+      `SELECT COUNT(*)::bigint AS n FROM access_logs WHERE created_at >= $1::date AND created_at < ($1::date + interval '1 day')`,
+      [day]
+    )).rows[0]?.n || 0n;
+
+    const verifyOk = (await q(
+      `SELECT COUNT(*)::bigint AS n FROM access_logs WHERE event='OTP_VERIFY_OK' AND created_at >= $1::date AND created_at < ($1::date + interval '1 day')`,
+      [day]
+    )).rows[0]?.n || 0n;
+
+    const grantOk = (await q(
+      `SELECT COUNT(*)::bigint AS n FROM access_logs WHERE event='GRANT_REDIRECT' AND created_at >= $1::date AND created_at < ($1::date + interval '1 day')`,
+      [day]
+    )).rows[0]?.n || 0n;
+
+    // prev hash = önceki günün hash_curr
+    const prevRow = (await q(
+      `SELECT hash_curr FROM daily_summaries WHERE day < $1::date ORDER BY day DESC LIMIT 1`,
+      [day]
+    )).rows[0];
+
+    const prevHash = prevRow ? String(prevRow.hash_curr || "") : "";
+
+    const material = `${day}|${tz}|${total}|${verifyOk}|${grantOk}|${prevHash}|${prevHash}`;
+    const hashCurr = sha256Hex(material);
+    const sig = hmacHex(DAILY_HMAC_SECRET, hashCurr);
+
+    await q(
+      `INSERT INTO daily_summaries(day, tz, count_total, count_verify_ok, count_grant_ok, hash_prev, hash_curr, hmac_sig)
+       VALUES($1::date,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (day) DO UPDATE SET
+         tz=EXCLUDED.tz,
+         count_total=EXCLUDED.count_total,
+         count_verify_ok=EXCLUDED.count_verify_ok,
+         count_grant_ok=EXCLUDED.count_grant_ok,
+         hash_prev=EXCLUDED.hash_prev,
+         hash_curr=EXCLUDED.hash_curr,
+         hmac_sig=EXCLUDED.hmac_sig,
+         created_at=NOW()`,
+      [day, tz, String(total), String(verifyOk), String(grantOk), prevHash || null, hashCurr, sig]
+    );
+
+    console.log("DAILY: built", { day, hashCurr: hashCurr.slice(0, 16) + "…" });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    console.log("DAILY build error", e.message || e);
   }
-});
+}
 
-app.get("/admin/daily/verify", basicAuthMiddleware, async (req, res) => {
-  const day = safeStr(req.query.day || new Date().toISOString().slice(0, 10));
-  try {
-    const out = await verifyDaily(day);
-    res.json(out);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-app.get("/admin/daily/export", basicAuthMiddleware, async (req, res) => {
-  const day = safeStr(req.query.day || new Date().toISOString().slice(0, 10));
-  const d = await q(`SELECT payload_text FROM daily_chains WHERE day=$1`, [day]);
-  if (!d.rows.length || !d.rows[0].payload_text) {
-    return res.status(404).send("No payload_text. Build first: /admin/daily/build?day=YYYY-MM-DD");
-  }
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="5651-${day}.txt"`);
-  res.send(d.rows[0].payload_text);
-});
-
-app.get("/admin/daily/export.json", basicAuthMiddleware, async (req, res) => {
-  const day = safeStr(req.query.day || new Date().toISOString().slice(0, 10));
-  const d = await q(`SELECT payload_json FROM daily_chains WHERE day=$1`, [day]);
-  if (!d.rows.length || !d.rows[0].payload_json) {
-    return res.status(404).json({ ok: false, error: "No payload_json. Build first." });
-  }
-  res.json(d.rows[0].payload_json);
-});
-
-// =========================
-// Boot
-// =========================
+// -------------------- Startup --------------------
 (async () => {
+  // ENV log
   console.log("ENV:", {
     OTP_MODE,
     OTP_TTL_SECONDS,
@@ -1012,20 +1053,16 @@ app.get("/admin/daily/export.json", basicAuthMiddleware, async (req, res) => {
     MAX_WRONG_ATTEMPTS,
     LOCK_SECONDS,
     KVKK_VERSION,
-    TZ,
-    DB_SET: Boolean(DATABASE_URL),
-    REDIS_SET: Boolean(REDIS_URL),
-    ADMIN_USER_SET: Boolean(ADMIN_USER),
-    ADMIN_PASS_SET: Boolean(ADMIN_PASS),
-    DAILY_HMAC_SET: Boolean(DAILY_HMAC_KEY),
+    TZ: process.env.TZ,
+    DB_SET: !!DB_URL,
+    REDIS_SET: !!REDIS_URL,
+    ADMIN_USER_SET: !!ADMIN_USER,
+    ADMIN_PASS_SET: !!ADMIN_PASS,
+    DAILY_HMAC_SET: !!DAILY_HMAC_SECRET,
   });
 
-  // init
-  redis = await initRedis();
-  pool = await initDb();
-  if (pool) await ensureSchema();
+  await ensureDb();
+  await buildTodayDaily();
 
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 })();
