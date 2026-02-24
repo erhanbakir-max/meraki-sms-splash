@@ -1,71 +1,65 @@
-"use strict";
+const axios = require("axios");
 
-/**
- * smsService.js
- * Default: MOCK SMS (does not fail)
- *
- * Env:
- *  SMS_PROVIDER=mock | http
- *  SMS_HTTP_URL=https://...
- *  SMS_HTTP_TOKEN=...
- *
- * Expected interface:
- *  sendSms(phone, text) -> Promise<void>
- */
+function normalizeTRPhone(phone) {
+  // Kabul: +90xxxxxxxxxx veya 05xxxxxxxxx veya 5xxxxxxxxx
+  let p = String(phone || "").trim();
+  p = p.replace(/\s+/g, "").replace(/-/g, "");
 
-async function sendSms(phone, text) {
-  const provider = (process.env.SMS_PROVIDER || "mock").toLowerCase();
+  if (p.startsWith("00")) p = "+" + p.slice(2);
+  if (p.startsWith("0")) p = p.slice(1);        // 05xx -> 5xx
+  if (p.startsWith("+90")) p = p.slice(3);      // +90 -> 5xx
+  if (p.startsWith("90")) p = p.slice(2);       // 90 -> 5xx
 
-  if (provider === "mock") {
-    console.log("[SMS MOCK] to:", phone, "text:", text);
-    return;
-  }
-
-  if (provider === "http") {
-    const url = process.env.SMS_HTTP_URL || "";
-    const token = process.env.SMS_HTTP_TOKEN || "";
-    if (!url) throw new Error("SMS_HTTP_URL missing");
-    // Minimal HTTP POST without extra deps:
-    const payload = JSON.stringify({ phone, text });
-    const u = new URL(url);
-
-    const mod = u.protocol === "https:" ? await import("https") : await import("http");
-    await new Promise((resolve, reject) => {
-      const req = mod.request(
-        {
-          method: "POST",
-          hostname: u.hostname,
-          port: u.port || (u.protocol === "https:" ? 443 : 80),
-          path: u.pathname + (u.search || ""),
-          headers: {
-            "content-type": "application/json",
-            "content-length": Buffer.byteLength(payload),
-            ...(token ? { authorization: `Bearer ${token}` } : {})
-          }
-        },
-        (res) => {
-          let data = "";
-          res.on("data", (d) => (data += d));
-          res.on("end", () => {
-            if (res.statusCode >= 200 && res.statusCode < 300) return resolve();
-            return reject(new Error(`SMS HTTP error ${res.statusCode}: ${data}`));
-          });
-        }
-      );
-      req.on("error", reject);
-      req.write(payload);
-      req.end();
-    });
-    return;
-  }
-
-  throw new Error("Unknown SMS_PROVIDER: " + provider);
+  // artık 5xxxxxxxxx bekliyoruz (10 hane)
+  if (!/^5\d{9}$/.test(p)) return null;
+  return "90" + p; // İleti Merkezi çoğu senaryoda 905xxxxxxxxx ister
 }
 
-module.exports = { sendSms };
+async function sendSMS(phone, message) {
+  const testMode = String(process.env.SMS_TEST_MODE || "false").toLowerCase() === "true";
+  const url = process.env.IM_API_URL;
+  const user = process.env.IM_USER;
+  const pass = process.env.IM_PASS;
+  const sender = process.env.IM_SENDER;
 
-/**
- * TODO (örnek):
- * - kendi SMS gateway’ine göre http payload’ı düzenle
- * - response parsing ekle
- */
+  const to = normalizeTRPhone(phone);
+  if (!to) throw new Error(`Invalid phone format: ${phone}`);
+
+  if (!url || !user || !pass || !sender) {
+    throw new Error("Missing SMS env vars: IM_API_URL / IM_USER / IM_PASS / IM_SENDER");
+  }
+
+  // ✅ REST/JSON örneği (İleti Merkezi hesabına göre payload alan adları değişebilir)
+  // Panel dökümanında "username/password" veya "user/pass" veya "api_key" gibi isimler olabilir.
+  const payload = {
+    username: user,
+    password: pass,
+    sender: sender,
+    message: message,
+    recipients: [to] // bazen "gsm" / "to" / "numbers" oluyor
+  };
+
+  if (testMode) {
+    console.log("SMS_TEST_MODE=TRUE. Would send:", { to, sender, message });
+    return { ok: true, test: true };
+  }
+
+  try {
+    const res = await axios.post(url, payload, {
+      timeout: 15000,
+      headers: { "Content-Type": "application/json" }
+    });
+
+    // Bazı API’ler 200 dönüp body’de hata kodu verir
+    const data = res.data;
+    // Burayı dökümana göre sıkılaştırırız:
+    // ör: data.status === "success" vb.
+    return data;
+  } catch (err) {
+    const detail = err?.response?.data || err.message;
+    console.error("IM SMS ERROR:", detail);
+    throw new Error("SMS send failed");
+  }
+}
+
+module.exports = { sendSMS };
