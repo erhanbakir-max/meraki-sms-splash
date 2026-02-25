@@ -19,11 +19,11 @@
  *   DATABASE_URL=...             (Railway Postgres)
  *   REDIS_URL=... or REDIS_PUBLIC_URL=...  (Railway Redis)
  *
- * İleti Merkezi (OTP_MODE=sms)
- *   IM_API_URL=... (from İleti Merkezi panel)
- *   IM_USER=...
- *   IM_PASS=...
- *   IM_SENDER=... (approved sender/header)
+ * İleti Merkezi (OTP_MODE=sms) - API Key/Hash auth (JSON)
+ *   IM_API_URL=https://api.iletimerkezi.com/v1/send-sms/json
+ *   IM_API_KEY=...   (API Key)
+ *   IM_API_HASH=...  (API Hash)  <-- panelde hash/secret üretilmiş olmalı
+ *   IM_SENDER=...    (approved sender/header)
  *   SMS_TEST_MODE=true|false     (true => no SMS sent; logs only)
  */
 
@@ -262,29 +262,38 @@ function normalizeTRPhoneForSms(input) {
 
 async function sendOtpSms(phoneRaw, otp) {
   const testMode = String(process.env.SMS_TEST_MODE || "false").toLowerCase() === "true";
-  const url = process.env.IM_API_URL;
-  const user = process.env.IM_USER;
-  const pass = process.env.IM_PASS;
-  const sender = process.env.IM_SENDER;
+
+  const url = (process.env.IM_API_URL || "").trim() || "https://api.iletimerkezi.com/v1/send-sms/json";
+  const key = String(process.env.IM_API_KEY || "").trim();
+  const hash = String(process.env.IM_API_HASH || "").trim();
+  const sender = String(process.env.IM_SENDER || "").trim();
 
   const to = normalizeTRPhoneForSms(phoneRaw);
   if (!to) throw new Error("MSISDN invalid");
-  if (!url || !user || !pass || !sender) {
-    throw new Error("İleti Merkezi env missing (IM_API_URL/IM_USER/IM_PASS/IM_SENDER)");
+  if (!key || !hash || !sender) {
+    throw new Error("İleti Merkezi env missing (IM_API_KEY/IM_API_HASH/IM_SENDER)");
   }
 
-  const message = `Odeon WiFi doğrulama kodunuz: ${otp}`;
+  const messageText = `Odeon WiFi doğrulama kodunuz: ${otp}`;
 
   const payload = {
-    username: user,
-    password: pass,
-    sender: sender,
-    message,
-    recipients: [to],
+    request: {
+      authentication: { key, hash },
+      order: {
+        sender,
+        sendDateTime: [],
+        iys: "1",
+        iysList: "BIREYSEL",
+        message: {
+          text: messageText,
+          receipents: { number: [to] }
+        }
+      }
+    }
   };
 
   if (testMode) {
-    console.log("SMS_TEST_MODE=TRUE. Would send:", { to, sender, message });
+    console.log("SMS_TEST_MODE=TRUE. Would send:", { to, sender, messageText, url });
     return { ok: true, test: true };
   }
 
@@ -320,11 +329,12 @@ function buildGrantUrl(baseGrantUrl, paramsObj) {
 
 // ----------------------- Routes -----------------------
 app.get("/health", (_req, res) => res.json({ ok: true, at: nowIso() }));
+
+// Meraki bazen parametreleri "/?base_grant_url=..." olarak gönderir.
+// Query düşmesin diye "/" isteğini "/splash"e query ile yönlendiriyoruz.
 app.get("/", (req, res) => {
-  // Meraki bazen parametreleri /?base_grant_url=... olarak gönderir.
-  // Query düşmesin diye /splash handler'ına aynı request'i yönlendiriyoruz.
-  req.url = "/splash" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
-  return app._router.handle(req, res, () => {});
+  const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+  return res.redirect(302, "/splash" + qs);
 });
 
 app.get("/splash", async (req, res) => {
@@ -337,7 +347,9 @@ app.get("/splash", async (req, res) => {
   const client_ip = req.query.client_ip ? String(req.query.client_ip) : "";
   const ssid = req.query.ssid ? String(req.query.ssid) : "";
   const ap_name = req.query.ap_name ? String(req.query.ap_name) : "";
-  const continue_url = req.query.continue_url ? String(req.query.continue_url) : (req.query.user_continue_url ? String(req.query.user_continue_url) : "");
+  const continue_url = req.query.continue_url
+    ? String(req.query.continue_url)
+    : (req.query.user_continue_url ? String(req.query.user_continue_url) : "");
 
   console.log("SPLASH_OPEN", {
     hasBaseGrant,
@@ -614,7 +626,6 @@ function dayStrTR(d = new Date()) {
 }
 
 async function rowsForDay(day) {
-  // simplest: use UTC day bounds; acceptable for minimal setup (TZ recorded separately)
   const start = new Date(`${day}T00:00:00.000Z`);
   const end = new Date(`${day}T23:59:59.999Z`);
   return (await q(
