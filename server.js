@@ -320,7 +320,12 @@ function buildGrantUrl(baseGrantUrl, paramsObj) {
 
 // ----------------------- Routes -----------------------
 app.get("/health", (_req, res) => res.json({ ok: true, at: nowIso() }));
-app.get("/", (_req, res) => res.redirect("/splash"));
+app.get("/", (req, res) => {
+  // Meraki bazen parametreleri /?base_grant_url=... olarak gönderir.
+  // Query düşmesin diye /splash handler'ına aynı request'i yönlendiriyoruz.
+  req.url = "/splash" + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
+  return app._router.handle(req, res, () => {});
+});
 
 app.get("/splash", async (req, res) => {
   console.log("SPLASH_URL", req.originalUrl);
