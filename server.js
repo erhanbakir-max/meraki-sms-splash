@@ -323,17 +323,20 @@ app.get("/health", (_req, res) => res.json({ ok: true, at: nowIso() }));
 app.get("/", (_req, res) => res.redirect("/splash"));
 
 app.get("/splash", async (req, res) => {
+  console.log("SPLASH_URL", req.originalUrl);
+
   const base_grant_url = req.query.base_grant_url ? String(req.query.base_grant_url) : "";
-  const hasBaseGrant = !!base_grant_url;
+  const hasBaseGrant = !!String(base_grant_url).trim();
 
   const client_mac = req.query.client_mac ? String(req.query.client_mac) : "";
   const client_ip = req.query.client_ip ? String(req.query.client_ip) : "";
   const ssid = req.query.ssid ? String(req.query.ssid) : "";
   const ap_name = req.query.ap_name ? String(req.query.ap_name) : "";
+  const continue_url = req.query.continue_url ? String(req.query.continue_url) : (req.query.user_continue_url ? String(req.query.user_continue_url) : "");
 
   console.log("SPLASH_OPEN", {
     hasBaseGrant,
-    hasContinue: !!req.query.continue_url,
+    hasContinue: !!String(continue_url || "").trim(),
     hasClientMac: !!client_mac,
     mode: OTP_MODE,
   });
@@ -344,8 +347,8 @@ app.get("/splash", async (req, res) => {
     ssid,
     ap_name,
     base_grant_url,
-    continue_url: req.query.continue_url ? String(req.query.continue_url) : null,
-    meta: { ...clientMeta(req) },
+    continue_url: continue_url || null,
+    meta: { ...clientMeta(req), raw_query: req.query },
   });
 
   res.type("html").send(`<!doctype html>
@@ -414,7 +417,7 @@ app.get("/splash", async (req, res) => {
           <div>KVKK metnini okudum ve kabul ediyorum.</div>
         </div>
 
-        <button class="btn" type="submit">Kodu Gönder</button>
+        <button class="btn" type="submit" ${!hasBaseGrant ? "disabled style=\"opacity:.6;cursor:not-allowed\" " : ""}>Kodu Gönder</button>
         <div class="tiny">Numara formatı: <b>5XXXXXXXXX</b> (başında 0 olmadan)</div>
       </form>
     </div>
@@ -435,13 +438,17 @@ app.post("/otp/start", async (req, res) => {
   const ssid = String(req.body.ssid || "");
   const ap_name = String(req.body.ap_name || "");
 
-  const base_grant_url = String(req.body.base_grant_url || "");
+  const base_grant_url = String(req.body.base_grant_url || "").trim();
+  console.log("OTP_START_BASE_GRANT", JSON.stringify(req.body.base_grant_url));
+
   const grant_params_json = String(req.body.grant_params_json || "{}");
   const kvkk_ok = req.body.kvkk_ok === "1";
 
   if (!kvkk_ok) return res.status(400).send("KVKK consent required");
   if (!phone10) return res.status(400).send("MSISDN format invalid. Expected 5XXXXXXXXX (10 digits).");
-  if (!base_grant_url) return res.status(400).send("base_grant_url missing");
+  if (!base_grant_url || !/^https?:\/\//i.test(base_grant_url)) {
+    return res.status(400).send("base_grant_url missing/invalid");
+  }
 
   const okMac = await rlHit(`rl:mac:${client_mac || "nomac"}`, RL_MAC_SECONDS);
   const okPhone = await rlHit(`rl:phone:${phone10}`, RL_PHONE_SECONDS);
@@ -466,7 +473,7 @@ app.post("/otp/start", async (req, res) => {
   await kvSet(`otp:${marker}`, payload, OTP_TTL_SECONDS);
 
   console.log("OTP_CREATED", { marker, last4: phone10.slice(-4), client_mac: client_mac || "" });
-  await dbLog("otp_created", { client_mac, client_ip, phone: phone10, full_name, ssid, ap_name, base_grant_url, continue_url: grantParams.continue_url || null, meta: { marker, ...clientMeta(req) } });
+  await dbLog("otp_created", { client_mac, client_ip, phone: phone10, full_name, ssid, ap_name, base_grant_url, continue_url: (grantParams.continue_url || grantParams.user_continue_url) || null, meta: { marker, ...clientMeta(req) } });
 
   try {
     if (OTP_MODE === "sms") {
@@ -520,13 +527,14 @@ app.post("/otp/verify", async (req, res) => {
     st.wrong = (st.wrong || 0) + 1;
     if (st.wrong >= MAX_WRONG_ATTEMPTS) st.lockedUntil = Date.now() + LOCK_SECONDS * 1000;
     await kvSet(key, st, Math.max(5, Math.floor((st.expiresAt - Date.now()) / 1000)));
-    await dbLog("otp_wrong", { client_mac: st.grant?.client_mac, client_ip: st.grant?.client_ip, phone: st.phone, full_name: st.full_name, ssid: st.grant?.ssid, ap_name: st.grant?.ap_name, base_grant_url: st.grant?.base_grant_url, continue_url: st.grant?.grantParams?.continue_url || null, meta: { marker, wrong: st.wrong } });
+    await dbLog("otp_wrong", { client_mac: st.grant?.client_mac, client_ip: st.grant?.client_ip, phone: st.phone, full_name: st.full_name, ssid: st.grant?.ssid, ap_name: st.grant?.ap_name, base_grant_url: st.grant?.base_grant_url, continue_url: (st.grant?.grantParams?.continue_url || st.grant?.grantParams?.user_continue_url) || null, meta: { marker, wrong: st.wrong } });
     return res.status(400).send("Wrong code");
   }
 
   console.log("OTP_VERIFY_OK", { marker, client_mac: st.grant?.client_mac || "" });
-  await dbLog("otp_verify_ok", { client_mac: st.grant?.client_mac, client_ip: st.grant?.client_ip, phone: st.phone, full_name: st.full_name, ssid: st.grant?.ssid, ap_name: st.grant?.ap_name, base_grant_url: st.grant?.base_grant_url, continue_url: st.grant?.grantParams?.continue_url || null, meta: { marker } });
+  await dbLog("otp_verify_ok", { client_mac: st.grant?.client_mac, client_ip: st.grant?.client_ip, phone: st.phone, full_name: st.full_name, ssid: st.grant?.ssid, ap_name: st.grant?.ap_name, base_grant_url: st.grant?.base_grant_url, continue_url: (st.grant?.grantParams?.continue_url || st.grant?.grantParams?.user_continue_url) || null, meta: { marker } });
 
+  console.log("VERIFY_BASE_GRANT", JSON.stringify(st.grant?.base_grant_url));
   const grantUrl = buildGrantUrl(st.grant?.base_grant_url, st.grant?.grantParams || {});
   if (!grantUrl) return res.status(400).send("OTP verified but base_grant_url missing");
 
